@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -19,7 +18,11 @@ if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
 // Get schedule for a specific term
 app.get("/api/schedule/:term", (req, res) => {
   const filePath = path.join(dataDir, `${req.params.term}.json`);
-  if (!fs.existsSync(filePath)) return res.json([]);
+  console.log(`Request for schedule file at: ${filePath}`);
+  if (!fs.existsSync(filePath)) {
+    console.log(`File not found: ${filePath}`);
+    return res.json([]);
+  }
   const data = fs.readFileSync(filePath);
   res.json(JSON.parse(data));
 });
@@ -32,6 +35,7 @@ app.post("/api/schedule/:term", (req, res) => {
   }
 
   try {
+    console.log("Parsing CSV data...");
     const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
     const cleaned = parsed.data
       .filter((r) => {
@@ -57,9 +61,13 @@ app.post("/api/schedule/:term", (req, res) => {
       });
 
     const outPath = path.join(dataDir, `${req.params.term}.json`);
+    console.log(`Saving data to: ${outPath}`);
     fs.writeFileSync(outPath, JSON.stringify(cleaned, null, 2));
+
+    console.log("Upload successful.");
     res.json({ success: true });
   } catch (e) {
+    console.error("Error during upload:", e);
     res.status(500).json({ error: "Failed to parse or save data" });
   }
 });
