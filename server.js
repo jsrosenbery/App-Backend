@@ -1,4 +1,3 @@
-
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
@@ -12,6 +11,11 @@ app.use(bodyParser.json({ limit: "10mb" }));
 
 // In-memory schedule store: { [term]: { csv, lastUpdated } }
 const scheduleByTerm = {};
+
+// List available terms
+app.get("/api/terms", (req, res) => {
+  res.json(Object.keys(scheduleByTerm));
+});
 
 // Upload schedule for a term (protected)
 app.post("/api/schedule/:term", (req, res) => {
@@ -36,7 +40,7 @@ app.get("/api/schedule/:term", (req, res) => {
   const data = scheduleByTerm[term];
 
   if (!data) {
-    return res.json([]);
+    return res.json({ lastUpdated: null, data: [] });
   }
 
   const parsed = Papa.parse(data.csv, { header: true, skipEmptyLines: true });
