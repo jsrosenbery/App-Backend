@@ -1,84 +1,54 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const cors = require("cors");
-const Papa = require("papaparse");
-const fs = require("fs");
-const path = require("path");
+// server.js
+
+const express = require('express');
+const multer = require('multer');
+const XLSX = require('xlsx');
+const cors = require('cors');
 
 const app = express();
-const port = process.env.PORT || 3000;
-
 app.use(cors());
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use(express.json());
 
-// Directory for schedules
-const scheduleDir = path.join(__dirname, "schedules");
-if (!fs.existsSync(scheduleDir)) {
-  fs.mkdirSync(scheduleDir);
-}
+let roomMetadata = [];
+let scheduleData = [];
 
-// In-memory schedule store: { [term]: { csv, lastUpdated } }
-const scheduleByTerm = {};
+// Multer setup
+const upload = multer();
 
-// Helper: Save schedule to disk
-function saveSchedule(term, csv, lastUpdated) {
-  const filePath = path.join(scheduleDir, `${term}.json`);
-  fs.writeFileSync(filePath, JSON.stringify({ csv, lastUpdated }), "utf8");
-}
-
-// Helper: Load all schedules from disk at startup
-function loadAllSchedules() {
-  const files = fs.readdirSync(scheduleDir);
-  files.forEach(file => {
-    if (file.endsWith(".json")) {
-      const term = file.replace(".json", "");
-      const data = JSON.parse(fs.readFileSync(path.join(scheduleDir, file), "utf8"));
-      scheduleByTerm[term] = data;
-    }
-  });
-}
-
-// Load schedules at server start
-loadAllSchedules();
-
-// List available terms
-app.get("/api/terms", (req, res) => {
-  res.json(Object.keys(scheduleByTerm));
+// Upload room metadata
+app.post('/api/rooms/metadata', upload.single('file'), (req, res) => {
+  try {
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const raw = XLSX.utils.sheet_to_json(sheet, { range: 3 });
+    roomMetadata = raw.map(r => ({
+      campus: r.Campus,
+      building: r.Building,
+      room: r['Room #'].toString(),
+      type: r.Type,
+      capacity: Number(r['# of Desks in Room'])
+    }));
+    res.json({ success: true, count: roomMetadata.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Upload schedule for a term (protected)
-app.post("/api/schedule/:term", (req, res) => {
-  const { csv, password } = req.body;
-  const term = req.params.term;
+// Get room metadata
+app.get('/api/rooms/metadata', (req, res) => {
+  res.json(roomMetadata);
+});
 
-  if (password !== "Upload2025") {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-
-  const lastUpdated = new Date().toISOString();
-  scheduleByTerm[term] = { csv, lastUpdated };
-  saveSchedule(term, csv, lastUpdated);
-
+// Placeholder: schedule upload endpoint
+app.post('/api/schedule', upload.single('file'), (req, res) => {
+  // TODO: parse CSV and load into scheduleData
   res.json({ success: true });
 });
 
-// Get parsed schedule for a term with lastUpdated
-app.get("/api/schedule/:term", (req, res) => {
-  const term = req.params.term;
-  const data = scheduleByTerm[term];
-
-  if (!data) {
-    return res.json({ lastUpdated: null, data: [] });
-  }
-
-  const parsed = Papa.parse(data.csv, { header: true, skipEmptyLines: true });
-
-  res.json({
-    lastUpdated: data.lastUpdated,
-    data: parsed.data
-  });
+// Get schedule data
+app.get('/api/schedule', (req, res) => {
+  res.json(scheduleData);
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
