@@ -1,93 +1,56 @@
-// server.js
-const express   = require('express');
-const cors      = require('cors');
-const multer    = require('multer');
-const Papa      = require('papaparse');
-const XLSX      = require('xlsx');
+const express = require("express");
+const bodyParser = require("body-parser");
+const cors = require("cors");
+const Papa = require("papaparse");
 
 const app = express();
+const port = process.env.PORT || 3000;
+
 app.use(cors());
+app.use(bodyParser.json({ limit: "10mb" }));
 
-// allow large payloads
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+// In-memory schedule store: { [term]: { csv, lastUpdated } }
+const scheduleByTerm = {};
 
-const upload = multer();
-let scheduleData = [];
-let roomMetadata = [];
+// List available terms
+app.get("/api/terms", (req, res) => {
+  res.json(Object.keys(scheduleByTerm));
+});
 
-/**
- * Upload a term’s schedule CSV.
- * Accepts either multipart/form-data (file upload)
- * or application/json with { password, csv: string }
- */
-app.post('/api/schedule/:term', upload.single('file'), (req, res) => {
-  const pw = req.body.password;
-  if (pw !== 'Upload2025') {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Upload schedule for a term (protected)
+app.post("/api/schedule/:term", (req, res) => {
+  const { csv, password } = req.body;
+  const term = req.params.term;
+
+  if (password !== "Upload2025") {
+    return res.status(403).json({ error: "Unauthorized" });
   }
 
-  let csvText;
-  if (req.file && req.file.buffer) {
-    // file upload path
-    csvText = req.file.buffer.toString();
-  } else if (req.body.csv) {
-    // JSON path
-    csvText = req.body.csv;
-  } else {
-    return res.status(400).json({ error: 'No file or csv payload provided' });
+  scheduleByTerm[term] = {
+    csv,
+    lastUpdated: new Date().toISOString()
+  };
+
+  res.json({ success: true });
+});
+
+// Get parsed schedule for a term with lastUpdated
+app.get("/api/schedule/:term", (req, res) => {
+  const term = req.params.term;
+  const data = scheduleByTerm[term];
+
+  if (!data) {
+    return res.json({ lastUpdated: null, data: [] });
   }
 
-  // parse into JSON rows
-  const parsed = Papa.parse(csvText, {
-    header: true,
-    skipEmptyLines: true
+  const parsed = Papa.parse(data.csv, { header: true, skipEmptyLines: true });
+
+  res.json({
+    lastUpdated: data.lastUpdated,
+    data: parsed.data
   });
-
-  if (parsed.errors.length) {
-    return res.status(400).json({ error: 'CSV parse error', details: parsed.errors });
-  }
-
-  scheduleData = parsed.data;
-  res.json({ success: true });
 });
 
-/**
- * Get the last‐uploaded schedule (ignores :term right now)
- */
-app.get(['/api/schedule', '/api/schedule/:term'], (req, res) => {
-  res.json(scheduleData);
-});
-
-/**
- * Upload room metadata Excel
- */
-app.post('/api/rooms/metadata', upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file provided' });
-  }
-  const wb  = XLSX.read(req.file.buffer, { type: 'buffer' });
-  const raw = XLSX.utils
-    .sheet_to_json(wb.Sheets[wb.SheetNames[0]], { range: 3 });
-  roomMetadata = raw.map(r => ({
-    campus:   r.Campus,
-    building: r.Building,
-    room:     String(r['Room Number']),
-    type:     r.Type,
-    capacity: Number(r['# of Desks in Room'])
-  }));
-  res.json({ success: true });
-});
-
-/**
- * Get room metadata
- */
-app.get('/api/rooms/metadata', (req, res) => {
-  res.json(roomMetadata);
-});
-
-// start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Backend listening on port ${PORT}`);
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
