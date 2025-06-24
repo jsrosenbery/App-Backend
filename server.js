@@ -3,33 +3,36 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const Papa = require('papaparse');
 const XLSX = require('xlsx');
 
 const app = express();
-app.use(cors()); // enable CORS for all origins
+app.use(cors());
 app.use(express.json());
 
 const upload = multer();
 
-let scheduleData = []; // in-memory; replace with DB if needed
+let scheduleData = [];
 let roomMetadata = [];
 
-// Schedule upload endpoint
+// POST /api/schedule
 app.post('/api/schedule', upload.single('file'), (req, res) => {
-  try {
-    // parse CSV into scheduleData (implement as needed)
-    // scheduleData = parsedData
-    res.json(scheduleData);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  const password = req.body.password;
+  if (password !== 'Upload2025') {
+    return res.status(401).json({ error: 'Unauthorized: incorrect password' });
   }
+  const csvString = req.file.buffer.toString('utf-8');
+  const parsed = Papa.parse(csvString, { header: true, skipEmptyLines: true });
+  scheduleData = parsed.data;
+  return res.json({ success: true, count: scheduleData.length });
 });
 
-app.get('/api/schedule', (req, res) => {
-  res.json(scheduleData);
+// GET /api/schedule and /api/schedule/:term
+app.get(['/api/schedule', '/api/schedule/:term'], (req, res) => {
+  return res.json(scheduleData);
 });
 
-// Room metadata endpoints
+// POST /api/rooms/metadata
 app.post('/api/rooms/metadata', upload.single('file'), (req, res) => {
   try {
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -42,15 +45,16 @@ app.post('/api/rooms/metadata', upload.single('file'), (req, res) => {
       type: r.Type,
       capacity: Number(r['# of Desks in Room'])
     }));
-    res.json({ success: true });
+    return res.json({ success: true, count: roomMetadata.length });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
+// GET /api/rooms/metadata
 app.get('/api/rooms/metadata', (req, res) => {
-  res.json(roomMetadata);
+  return res.json(roomMetadata);
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
