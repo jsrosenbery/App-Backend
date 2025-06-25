@@ -1,9 +1,15 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const cors = require('cors');
 const Papa = require('papaparse');
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Enable CORS for your frontend
+app.use(cors({
+  origin: 'https://cos-app.vercel.app'
+}));
 
 app.use(express.json({ limit: '50mb' }));
 
