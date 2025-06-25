@@ -1,56 +1,55 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const cors = require("cors");
-const Papa = require("papaparse");
-
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const Papa = require('papaparse');
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use(express.json({ limit: '50mb' }));
 
-// In-memory schedule store: { [term]: { csv, lastUpdated } }
-const scheduleByTerm = {};
+// Directory to store CSV files
+const DATA_DIR = path.join(__dirname, 'schedules');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-// List available terms
-app.get("/api/terms", (req, res) => {
-  res.json(Object.keys(scheduleByTerm));
-});
-
-// Upload schedule for a term (protected)
-app.post("/api/schedule/:term", (req, res) => {
-  const { csv, password } = req.body;
+// POST endpoint to upload schedule CSV
+app.post('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
-
-  if (password !== "Upload2025") {
-    return res.status(403).json({ error: "Unauthorized" });
+  const { csv, password } = req.body;
+  if (password !== 'Upload2025') {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  scheduleByTerm[term] = {
-    csv,
-    lastUpdated: new Date().toISOString()
-  };
-
-  res.json({ success: true });
+  const filePath = path.join(DATA_DIR, `${term}.csv`);
+  try {
+    fs.writeFileSync(filePath, csv);
+    const now = new Date().toISOString();
+    return res.json({ success: true, lastUpdated: now });
+  } catch (err) {
+    console.error('Write error:', err);
+    return res.status(500).json({ error: 'File write failed' });
+  }
 });
 
-// Get parsed schedule for a term with lastUpdated
-app.get("/api/schedule/:term", (req, res) => {
+// GET endpoint to fetch and parse schedule CSV
+app.get('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
-  const data = scheduleByTerm[term];
-
-  if (!data) {
+  const filePath = path.join(DATA_DIR, `${term}.csv`);
+  if (!fs.existsSync(filePath)) {
     return res.json({ lastUpdated: null, data: [] });
   }
 
-  const parsed = Papa.parse(data.csv, { header: true, skipEmptyLines: true });
-
-  res.json({
-    lastUpdated: data.lastUpdated,
-    data: parsed.data
-  });
+  try {
+    const csv = fs.readFileSync(filePath, 'utf8');
+    const stats = fs.statSync(filePath);
+    const lastUpdated = stats.mtime.toISOString();
+    const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
+    return res.json({ lastUpdated, data: parsed.data });
+  } catch (err) {
+    console.error('Read error:', err);
+    return res.status(500).json({ error: 'File read failed' });
+  }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
