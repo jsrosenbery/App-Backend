@@ -6,9 +6,23 @@ const Papa = require('papaparse');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS for your frontend
+// Build your list of allowed origins
+const allowedOrigins = [
+  process.env.CORS_ORIGIN,            // staging or prod from env
+  'https://cos-app.vercel.app'        // always allow production front-end
+].filter(Boolean);
+
+console.log('Allowed CORS origins:', allowedOrigins);
+
 app.use(cors({
-  origin: 'https://cos-app.vercel.app'
+  origin: (incomingOrigin, callback) => {
+    // allow non-browser/postman/etc requests
+    if (!incomingOrigin) return callback(null, true);
+    if (allowedOrigins.includes(incomingOrigin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`Origin ${incomingOrigin} not allowed by CORS`));
+  }
 }));
 
 app.use(express.json({ limit: '50mb' }));
@@ -23,7 +37,7 @@ if (!fs.existsSync(DATA_DIR)) {
 app.post('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
   const { csv, password } = req.body;
-  if (password !== 'Upload2025') {
+  if (password !== process.env.UPLOAD_PASSWORD) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -58,4 +72,6 @@ app.get('/api/schedule/:term', (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Listening on port ${PORT} in ${process.env.NODE_ENV || 'production'} mode`);
+});
