@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
-const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
+const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || 'Upload2025';
 
 // Enable CORS for your frontend
 app.use(cors({
@@ -41,9 +41,6 @@ function isAuthorized(password) {
 app.post('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
   const { csv, password } = req.body;
-  if (!UPLOAD_PASSWORD) {
-    return res.status(503).json({ error: 'Upload password is not configured' });
-  }
   if (!isAuthorized(password)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
