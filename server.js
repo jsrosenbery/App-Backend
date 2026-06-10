@@ -3,12 +3,15 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const Papa = require('papaparse');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
+const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
 
 // Enable CORS for your frontend
 app.use(cors({
-  origin: 'https://cos-app.vercel.app'
+  origin: CORS_ORIGIN
 }));
 
 app.use(express.json({ limit: '50mb' }));
@@ -19,15 +22,39 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+function getSchedulePath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(DATA_DIR, `${term}.csv`);
+  const dataRoot = path.resolve(DATA_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function isAuthorized(password) {
+  if (!UPLOAD_PASSWORD) return false;
+  if (typeof password !== 'string') return false;
+  const expected = Buffer.from(UPLOAD_PASSWORD);
+  const supplied = Buffer.from(password);
+  return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
+}
+
 // POST endpoint to upload schedule CSV
 app.post('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
   const { csv, password } = req.body;
-  if (password !== 'Upload2025') {
+  if (!UPLOAD_PASSWORD) {
+    return res.status(503).json({ error: 'Upload password is not configured' });
+  }
+  if (!isAuthorized(password)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
+  if (typeof csv !== 'string') {
+    return res.status(400).json({ error: 'CSV payload is required' });
+  }
 
-  const filePath = path.join(DATA_DIR, `${term}.csv`);
+  const filePath = getSchedulePath(term);
+  if (!filePath) {
+    return res.status(400).json({ error: 'Invalid term' });
+  }
   try {
     fs.writeFileSync(filePath, csv);
     const now = new Date().toISOString();
@@ -41,7 +68,10 @@ app.post('/api/schedule/:term', (req, res) => {
 // GET endpoint to fetch and parse schedule CSV
 app.get('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
-  const filePath = path.join(DATA_DIR, `${term}.csv`);
+  const filePath = getSchedulePath(term);
+  if (!filePath) {
+    return res.status(400).json({ error: 'Invalid term' });
+  }
   if (!fs.existsSync(filePath)) {
     return res.json({ lastUpdated: null, data: [] });
   }
