@@ -17,8 +17,12 @@ app.use(cors({
 
 app.use(express.json({ limit: '50mb' }));
 
-// Directory to store CSV files
-const DATA_DIR = path.join(__dirname, 'schedules');
+// Directory to store uploaded data. On hosted environments, set DATA_DIR or
+// SCHEDULE_DATA_DIR to a mounted persistent disk path so imports survive restarts.
+const DEFAULT_DATA_DIR = fs.existsSync('/var/data')
+  ? path.join('/var/data', 'cos-app')
+  : path.join(__dirname, 'schedules');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || process.env.SCHEDULE_DATA_DIR || DEFAULT_DATA_DIR);
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
