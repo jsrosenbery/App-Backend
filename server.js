@@ -28,6 +28,7 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
 const MODALITY_DEFINITIONS_PATH = path.join(DATA_DIR, 'modalities.json');
+const CAL_GETC_MAPPING_PATH = path.join(DATA_DIR, 'cal-getc-mapping.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
@@ -108,6 +109,38 @@ function normalizeModalityDefinitions(definitions) {
   return normalized;
 }
 
+function splitList(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(/[;,|]/)
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeCalGetcCode(value) {
+  return String(value || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function normalizeCalGetcMapping(mapping) {
+  if (!Array.isArray(mapping)) return null;
+  const normalized = [];
+  for (const item of mapping) {
+    if (!item || typeof item !== 'object') continue;
+    const code = normalizeCalGetcCode(item.code || item.Code || item.course || item.Course || item['Course Code']);
+    const areas = splitList(item.areas || item.Areas || item.area || item.Area || item['CAL-GETC Area']);
+    const divisions = splitList(item.divisions || item.Divisions || item.division || item.Division || item['CAL-GETC Division']);
+    if (!code || (!areas.length && !divisions.length)) continue;
+    normalized.push({ code, areas, divisions });
+  }
+  return normalized;
+}
+
 function readRoomCatalog() {
   if (!fs.existsSync(ROOM_CATALOG_PATH)) {
     return { lastUpdated: null, data: [] };
@@ -126,6 +159,18 @@ function readModalityDefinitions() {
   }
   const json = fs.readFileSync(MODALITY_DEFINITIONS_PATH, 'utf8');
   const stats = fs.statSync(MODALITY_DEFINITIONS_PATH);
+  return {
+    lastUpdated: stats.mtime.toISOString(),
+    data: JSON.parse(json)
+  };
+}
+
+function readCalGetcMapping() {
+  if (!fs.existsSync(CAL_GETC_MAPPING_PATH)) {
+    return { lastUpdated: null, data: [] };
+  }
+  const json = fs.readFileSync(CAL_GETC_MAPPING_PATH, 'utf8');
+  const stats = fs.statSync(CAL_GETC_MAPPING_PATH);
   return {
     lastUpdated: stats.mtime.toISOString(),
     data: JSON.parse(json)
@@ -293,6 +338,34 @@ app.post('/api/modalities/import', (req, res) => {
   } catch (err) {
     console.error('Modality definitions write error:', err);
     return res.status(500).json({ error: 'Modality definitions write failed' });
+  }
+});
+
+app.get('/api/cal-getc', (req, res) => {
+  try {
+    return res.json(readCalGetcMapping());
+  } catch (err) {
+    console.error('CAL-GETC mapping read error:', err);
+    return res.status(500).json({ error: 'CAL-GETC mapping read failed' });
+  }
+});
+
+app.post('/api/cal-getc/import', (req, res) => {
+  const { password, mapping } = req.body || {};
+  if (!isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const normalized = normalizeCalGetcMapping(mapping);
+  if (!normalized || !normalized.length) {
+    return res.status(400).json({ error: 'CAL-GETC mapping payload is required' });
+  }
+  try {
+    fs.writeFileSync(CAL_GETC_MAPPING_PATH, JSON.stringify(normalized, null, 2));
+    const now = new Date().toISOString();
+    return res.json({ success: true, lastUpdated: now, count: normalized.length, data: normalized });
+  } catch (err) {
+    console.error('CAL-GETC mapping write error:', err);
+    return res.status(500).json({ error: 'CAL-GETC mapping write failed' });
   }
 });
 
