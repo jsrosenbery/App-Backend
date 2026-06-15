@@ -23,10 +23,28 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
+const MODALITY_DEFINITIONS_PATH = path.join(DATA_DIR, 'modalities.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
+
+const DEFAULT_MODALITY_DEFINITIONS = [
+  { code: 'IP', modality: 'In Person', omitted: false },
+  { code: 'ONL', modality: 'Online', omitted: false },
+  { code: 'HYB', modality: 'Hybrid', omitted: false },
+  { code: 'DE', modality: 'Dual Enrollment', omitted: false },
+  { code: 'FLX', modality: 'Flex', omitted: false },
+  { code: '02S', modality: 'In Person', omitted: false },
+  { code: '022', modality: 'In Person', omitted: false },
+  { code: 'OL', modality: 'Online', omitted: false },
+  { code: 'ONN', modality: 'Online', omitted: false },
+  { code: 'O1', modality: 'Online', omitted: false },
+  { code: 'ONS', modality: 'Online', omitted: false },
+  { code: '02N', modality: 'In Person', omitted: false },
+  { code: 'CPL', modality: 'Omitted from modality analysis', omitted: true },
+  { code: '20', modality: 'Omitted from modality analysis', omitted: true }
+];
 
 function getSchedulePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
@@ -67,12 +85,43 @@ function normalizeRoomCatalog(rooms) {
   return normalized;
 }
 
+function normalizeModalityDefinitions(definitions) {
+  if (!Array.isArray(definitions)) return null;
+  const normalized = [];
+  for (const item of definitions) {
+    if (!item || typeof item !== 'object') continue;
+    const code = String(item.code || item.Code || item.instructionalMethod || item['Instructional Method'] || '').trim().toUpperCase();
+    const modality = String(item.modality || item.Modality || item.category || item.Category || '').trim();
+    const rawOmitted = item.omitted ?? item.Omitted ?? item.omit ?? item.Omit ?? item.exclude ?? item.Exclude;
+    const omitted = rawOmitted === true || String(rawOmitted || '').trim().toLowerCase() === 'true' || String(rawOmitted || '').trim().toLowerCase() === 'yes' || String(rawOmitted || '').trim() === '1';
+    if (!code || (!omitted && !modality)) continue;
+    normalized.push({
+      code,
+      modality: omitted ? (modality || 'Omitted from modality analysis') : modality,
+      omitted
+    });
+  }
+  return normalized;
+}
+
 function readRoomCatalog() {
   if (!fs.existsSync(ROOM_CATALOG_PATH)) {
     return { lastUpdated: null, data: [] };
   }
   const json = fs.readFileSync(ROOM_CATALOG_PATH, 'utf8');
   const stats = fs.statSync(ROOM_CATALOG_PATH);
+  return {
+    lastUpdated: stats.mtime.toISOString(),
+    data: JSON.parse(json)
+  };
+}
+
+function readModalityDefinitions() {
+  if (!fs.existsSync(MODALITY_DEFINITIONS_PATH)) {
+    return { lastUpdated: null, data: DEFAULT_MODALITY_DEFINITIONS };
+  }
+  const json = fs.readFileSync(MODALITY_DEFINITIONS_PATH, 'utf8');
+  const stats = fs.statSync(MODALITY_DEFINITIONS_PATH);
   return {
     lastUpdated: stats.mtime.toISOString(),
     data: JSON.parse(json)
@@ -212,6 +261,34 @@ app.post('/api/rooms/import', (req, res) => {
   } catch (err) {
     console.error('Room catalog write error:', err);
     return res.status(500).json({ error: 'Room catalog write failed' });
+  }
+});
+
+app.get('/api/modalities', (req, res) => {
+  try {
+    return res.json(readModalityDefinitions());
+  } catch (err) {
+    console.error('Modality definitions read error:', err);
+    return res.status(500).json({ error: 'Modality definitions read failed' });
+  }
+});
+
+app.post('/api/modalities/import', (req, res) => {
+  const { password, definitions } = req.body || {};
+  if (!isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const normalized = normalizeModalityDefinitions(definitions);
+  if (!normalized || !normalized.length) {
+    return res.status(400).json({ error: 'Modality definitions payload is required' });
+  }
+  try {
+    fs.writeFileSync(MODALITY_DEFINITIONS_PATH, JSON.stringify(normalized, null, 2));
+    const now = new Date().toISOString();
+    return res.json({ success: true, lastUpdated: now, count: normalized.length, data: normalized });
+  } catch (err) {
+    console.error('Modality definitions write error:', err);
+    return res.status(500).json({ error: 'Modality definitions write failed' });
   }
 });
 
