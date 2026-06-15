@@ -4,6 +4,7 @@ const path = require('path');
 const cors = require('cors');
 const Papa = require('papaparse');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
@@ -22,6 +23,10 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
+const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
+if (!fs.existsSync(CONVERT_DIR)) {
+  fs.mkdirSync(CONVERT_DIR, { recursive: true });
+}
 
 function getSchedulePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
@@ -72,6 +77,53 @@ function readRoomCatalog() {
     lastUpdated: stats.mtime.toISOString(),
     data: JSON.parse(json)
   };
+}
+
+function safeFilename(name, fallback) {
+  const clean = String(name || '').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 120);
+  return clean || fallback;
+}
+
+function runCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function convertDocxToPdf(inputPath, outputDir) {
+  const commands = [
+    process.env.LIBREOFFICE_PATH,
+    'soffice',
+    'libreoffice'
+  ].filter(Boolean);
+  let lastError = null;
+  for (const command of commands) {
+    try {
+      await runCommand(command, [
+        '--headless',
+        '--convert-to',
+        'pdf',
+        '--outdir',
+        outputDir,
+        inputPath
+      ], { timeout: 30000 });
+      const outputPath = path.join(outputDir, `${path.basename(inputPath, path.extname(inputPath))}.pdf`);
+      if (fs.existsSync(outputPath)) return outputPath;
+      lastError = new Error('LibreOffice finished without producing a PDF.');
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  const detail = lastError?.stderr || lastError?.message || 'LibreOffice/soffice was not found.';
+  throw new Error(`DOCX-to-PDF converter unavailable or failed. ${detail}`);
 }
 
 // POST endpoint to upload schedule CSV
@@ -160,6 +212,43 @@ app.post('/api/rooms/import', (req, res) => {
   } catch (err) {
     console.error('Room catalog write error:', err);
     return res.status(500).json({ error: 'Room catalog write failed' });
+  }
+});
+
+app.post('/api/convert/docx-to-pdf', async (req, res) => {
+  const { filename, docxBase64 } = req.body || {};
+  if (typeof docxBase64 !== 'string' || !docxBase64.trim()) {
+    return res.status(400).send('DOCX payload is required');
+  }
+
+  const requestId = crypto.randomBytes(8).toString('hex');
+  const requestDir = path.join(CONVERT_DIR, requestId);
+  fs.mkdirSync(requestDir, { recursive: true });
+  const inputName = safeFilename(filename, 'schedule-change-form.docx').replace(/\.pdf$/i, '.docx');
+  const inputPath = path.join(requestDir, inputName.toLowerCase().endsWith('.docx') ? inputName : `${inputName}.docx`);
+
+  try {
+    fs.writeFileSync(inputPath, Buffer.from(docxBase64, 'base64'));
+    const pdfPath = await convertDocxToPdf(inputPath, requestDir);
+    const downloadName = path.basename(inputPath, path.extname(inputPath)) + '.pdf';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    return res.sendFile(pdfPath, err => {
+      try {
+        fs.rmSync(requestDir, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        console.error('Conversion cleanup error:', cleanupErr);
+      }
+      if (err) console.error('PDF send error:', err);
+    });
+  } catch (err) {
+    try {
+      fs.rmSync(requestDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      console.error('Conversion cleanup error:', cleanupErr);
+    }
+    console.error('DOCX conversion error:', err);
+    return res.status(500).send(err.message || 'DOCX-to-PDF conversion failed');
   }
 });
 
