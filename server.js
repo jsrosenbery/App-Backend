@@ -36,8 +36,12 @@ const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
 const MODALITY_DEFINITIONS_PATH = path.join(DATA_DIR, 'modalities.json');
 const CAL_GETC_MAPPING_PATH = path.join(DATA_DIR, 'cal-getc-mapping.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
+const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
+}
+if (!fs.existsSync(ANALYTICS_ARCHIVE_DIR)) {
+  fs.mkdirSync(ANALYTICS_ARCHIVE_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -61,6 +65,13 @@ function getSchedulePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(DATA_DIR, `${term}.csv`);
   const dataRoot = path.resolve(DATA_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function getAnalyticsArchivePath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(ANALYTICS_ARCHIVE_DIR, `${term}.csv`);
+  const dataRoot = path.resolve(ANALYTICS_ARCHIVE_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
@@ -275,6 +286,69 @@ app.get('/api/schedule/:term', (req, res) => {
   } catch (err) {
     console.error('Read error:', err);
     return res.status(500).json({ error: 'File read failed' });
+  }
+});
+
+app.get('/api/analytics-archive', (req, res) => {
+  try {
+    const terms = fs.readdirSync(ANALYTICS_ARCHIVE_DIR)
+      .filter(file => file.toLowerCase().endsWith('.csv'))
+      .map(file => {
+        const filePath = path.join(ANALYTICS_ARCHIVE_DIR, file);
+        const stats = fs.statSync(filePath);
+        return {
+          term: path.basename(file, '.csv'),
+          lastUpdated: stats.mtime.toISOString()
+        };
+      })
+      .sort((a, b) => a.term.localeCompare(b.term, undefined, { numeric: true }));
+    return res.json({ data: terms });
+  } catch (err) {
+    console.error('Analytics archive list error:', err);
+    return res.status(500).json({ error: 'Analytics archive list failed' });
+  }
+});
+
+app.get('/api/analytics-archive/:term', (req, res) => {
+  const term = req.params.term;
+  const filePath = getAnalyticsArchivePath(term);
+  if (!filePath) {
+    return res.status(400).json({ error: 'Invalid term' });
+  }
+  if (!fs.existsSync(filePath)) {
+    return res.json({ term, lastUpdated: null, data: [] });
+  }
+  try {
+    const csv = fs.readFileSync(filePath, 'utf8');
+    const stats = fs.statSync(filePath);
+    const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
+    return res.json({ term, lastUpdated: stats.mtime.toISOString(), data: parsed.data });
+  } catch (err) {
+    console.error('Analytics archive read error:', err);
+    return res.status(500).json({ error: 'Analytics archive read failed' });
+  }
+});
+
+app.post('/api/analytics-archive/:term', (req, res) => {
+  const term = req.params.term;
+  const { csv, password } = req.body || {};
+  if (!isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (typeof csv !== 'string' || !csv.trim()) {
+    return res.status(400).json({ error: 'CSV payload is required' });
+  }
+  const filePath = getAnalyticsArchivePath(term);
+  if (!filePath) {
+    return res.status(400).json({ error: 'Invalid term' });
+  }
+  try {
+    fs.writeFileSync(filePath, csv);
+    const now = new Date().toISOString();
+    return res.json({ success: true, term, lastUpdated: now });
+  } catch (err) {
+    console.error('Analytics archive write error:', err);
+    return res.status(500).json({ error: 'Analytics archive write failed' });
   }
 });
 
