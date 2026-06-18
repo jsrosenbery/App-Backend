@@ -35,6 +35,7 @@ if (!fs.existsSync(DATA_DIR)) {
 const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
 const MODALITY_DEFINITIONS_PATH = path.join(DATA_DIR, 'modalities.json');
 const CAL_GETC_MAPPING_PATH = path.join(DATA_DIR, 'cal-getc-mapping.json');
+const CURRICULUM_CROSSWALK_PATH = path.join(DATA_DIR, 'curriculum-crosswalk.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 if (!fs.existsSync(CONVERT_DIR)) {
@@ -158,6 +159,38 @@ function normalizeCalGetcMapping(mapping) {
   return normalized;
 }
 
+function normalizeCourseCode(value) {
+  return String(value || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function normalizeCurriculumCrosswalk(crosswalk) {
+  if (!Array.isArray(crosswalk)) return null;
+  const normalized = [];
+  for (const item of crosswalk) {
+    if (!item || typeof item !== 'object') continue;
+    const sourceCourse = normalizeCourseCode(item.sourceCourse || item.SourceCourse || item['Source Course'] || item.oldCourse || item['Old Course'] || item.cosCourse || item['COS Course']);
+    const synonymCourse = normalizeCourseCode(item.synonymCourse || item.SynonymCourse || item['Synonym Course'] || item.newCourse || item['New Course'] || item.commonCourse || item['Common Course']);
+    if (!sourceCourse || !synonymCourse) continue;
+    normalized.push({
+      sourceCourse,
+      synonymCourse,
+      sourceTitle: String(item.sourceTitle || item.SourceTitle || item['Source Title'] || item.cosTitle || item['COS Title'] || '').trim(),
+      synonymTitle: String(item.synonymTitle || item.SynonymTitle || item['Synonym Title'] || item.commonTitle || item['Common Title'] || '').trim(),
+      changeType: String(item.changeType || item.ChangeType || item['Change Type'] || item.type || item.Type || 'Curriculum Crosswalk').trim(),
+      phase: String(item.phase || item.Phase || '').trim(),
+      cid: String(item.cid || item.CID || item['C-ID'] || '').trim(),
+      template: String(item.template || item.Template || '').trim(),
+      effectiveTerm: String(item.effectiveTerm || item.EffectiveTerm || item['Effective Term'] || '').trim(),
+      notes: String(item.notes || item.Notes || '').trim()
+    });
+  }
+  return normalized;
+}
+
 function readRoomCatalog() {
   if (!fs.existsSync(ROOM_CATALOG_PATH)) {
     return { lastUpdated: null, data: [] };
@@ -188,6 +221,18 @@ function readCalGetcMapping() {
   }
   const json = fs.readFileSync(CAL_GETC_MAPPING_PATH, 'utf8');
   const stats = fs.statSync(CAL_GETC_MAPPING_PATH);
+  return {
+    lastUpdated: stats.mtime.toISOString(),
+    data: JSON.parse(json)
+  };
+}
+
+function readCurriculumCrosswalk() {
+  if (!fs.existsSync(CURRICULUM_CROSSWALK_PATH)) {
+    return { lastUpdated: null, data: [] };
+  }
+  const json = fs.readFileSync(CURRICULUM_CROSSWALK_PATH, 'utf8');
+  const stats = fs.statSync(CURRICULUM_CROSSWALK_PATH);
   return {
     lastUpdated: stats.mtime.toISOString(),
     data: JSON.parse(json)
@@ -446,6 +491,34 @@ app.post('/api/cal-getc/import', (req, res) => {
   } catch (err) {
     console.error('CAL-GETC mapping write error:', err);
     return res.status(500).json({ error: 'CAL-GETC mapping write failed' });
+  }
+});
+
+app.get('/api/curriculum-crosswalk', (req, res) => {
+  try {
+    return res.json(readCurriculumCrosswalk());
+  } catch (err) {
+    console.error('Curriculum crosswalk read error:', err);
+    return res.status(500).json({ error: 'Curriculum crosswalk read failed' });
+  }
+});
+
+app.post('/api/curriculum-crosswalk/import', (req, res) => {
+  const { password, crosswalk } = req.body || {};
+  if (!isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const normalized = normalizeCurriculumCrosswalk(crosswalk);
+  if (!normalized || !normalized.length) {
+    return res.status(400).json({ error: 'Curriculum crosswalk payload is required' });
+  }
+  try {
+    fs.writeFileSync(CURRICULUM_CROSSWALK_PATH, JSON.stringify(normalized, null, 2));
+    const now = new Date().toISOString();
+    return res.json({ success: true, lastUpdated: now, count: normalized.length, data: normalized });
+  } catch (err) {
+    console.error('Curriculum crosswalk write error:', err);
+    return res.status(500).json({ error: 'Curriculum crosswalk write failed' });
   }
 });
 
