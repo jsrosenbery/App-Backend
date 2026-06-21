@@ -9,6 +9,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
 const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
+const ENROLLMENT_SESSION_TTL_MS = Number(process.env.ENROLLMENT_SESSION_TTL_MS || 30 * 60 * 1000);
+const enrollmentSessions = new Map();
 
 // Enable CORS for your frontend
 app.use(cors({
@@ -82,6 +84,42 @@ function isAuthorized(password) {
   const expected = Buffer.from(UPLOAD_PASSWORD);
   const supplied = Buffer.from(password);
   return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
+}
+
+function issueEnrollmentSession() {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAtMs = Date.now() + ENROLLMENT_SESSION_TTL_MS;
+  enrollmentSessions.set(token, expiresAtMs);
+  return {
+    token,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    expiresInSeconds: Math.floor(ENROLLMENT_SESSION_TTL_MS / 1000)
+  };
+}
+
+function cleanupEnrollmentSessions() {
+  const now = Date.now();
+  for (const [token, expiresAtMs] of enrollmentSessions.entries()) {
+    if (expiresAtMs <= now) enrollmentSessions.delete(token);
+  }
+}
+
+function getBearerToken(req) {
+  const header = req.get('authorization') || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function isEnrollmentSessionAuthorized(req) {
+  cleanupEnrollmentSessions();
+  const token = getBearerToken(req);
+  if (!token) return false;
+  const expiresAtMs = enrollmentSessions.get(token);
+  if (!expiresAtMs || expiresAtMs <= Date.now()) {
+    enrollmentSessions.delete(token);
+    return false;
+  }
+  return true;
 }
 
 function normalizeRoomCatalog(rooms) {
@@ -286,6 +324,14 @@ async function convertDocxToPdf(inputPath, outputDir) {
   throw new Error(`DOCX-to-PDF converter unavailable or failed. ${detail}`);
 }
 
+app.post('/api/auth/enrollment-management', (req, res) => {
+  const { password } = req.body || {};
+  if (!isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  return res.json(issueEnrollmentSession());
+});
+
 // POST endpoint to upload schedule CSV
 app.post('/api/schedule/:term', (req, res) => {
   const term = req.params.term;
@@ -377,7 +423,7 @@ app.get('/api/analytics-archive/:term', (req, res) => {
 app.post('/api/analytics-archive/:term', (req, res) => {
   const term = req.params.term;
   const { csv, password } = req.body || {};
-  if (!isAuthorized(password)) {
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   if (typeof csv !== 'string' || !csv.trim()) {
