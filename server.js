@@ -8,13 +8,22 @@ const { execFile } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || CORS_ORIGIN)
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
 const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
 const ENROLLMENT_SESSION_TTL_MS = Number(process.env.ENROLLMENT_SESSION_TTL_MS || 30 * 60 * 1000);
 const enrollmentSessions = new Map();
 
 // Enable CORS for your frontend
 app.use(cors({
-  origin: CORS_ORIGIN
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (CORS_ORIGINS.includes(origin)) return callback(null, true);
+    if (/^https:\/\/cos-app(?:-[a-z0-9-]+)?\.vercel\.app$/i.test(origin)) return callback(null, true);
+    return callback(new Error(`CORS origin not allowed: ${origin}`));
+  }
 }));
 
 app.use(express.json({ limit: '50mb' }));
