@@ -47,6 +47,7 @@ const ROOM_CATALOG_PATH = path.join(DATA_DIR, 'rooms.json');
 const MODALITY_DEFINITIONS_PATH = path.join(DATA_DIR, 'modalities.json');
 const CAL_GETC_MAPPING_PATH = path.join(DATA_DIR, 'cal-getc-mapping.json');
 const CURRICULUM_CROSSWALK_PATH = path.join(DATA_DIR, 'curriculum-crosswalk.json');
+const ENROLLMENT_SNAPSHOTS_PATH = path.join(DATA_DIR, 'enrollment-snapshots.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 if (!fs.existsSync(CONVERT_DIR)) {
@@ -286,6 +287,65 @@ function readCurriculumCrosswalk() {
   };
 }
 
+function snapshotKey(record) {
+  return [
+    String(record.term || record.Term || '').trim().toUpperCase(),
+    String(record.crn || record.CRN || '').trim().toUpperCase(),
+    String(record.snapshotType || record['Snapshot Type'] || '').trim().toUpperCase()
+  ].join('|');
+}
+
+function normalizeEnrollmentSnapshotRecords(records) {
+  if (!Array.isArray(records)) return null;
+  const normalized = [];
+  for (const item of records) {
+    if (!item || typeof item !== 'object') continue;
+    const record = {
+      term: String(item.term || item.Term || '').trim().toUpperCase(),
+      crn: String(item.crn || item.CRN || '').trim().toUpperCase(),
+      snapshotType: String(item.snapshotType || item['Snapshot Type'] || '').trim().toUpperCase(),
+      snapshotDate: String(item.snapshotDate || item['Snapshot Date'] || '').trim(),
+      enrollment: Number(item.enrollment ?? item.Enrollment ?? 0),
+      sourceFieldUsed: String(item.sourceFieldUsed || item['Source Field Used'] || '').trim(),
+      subject: String(item.subject || item.Subject || '').trim().toUpperCase(),
+      course: String(item.course || item.Course || '').trim().toUpperCase(),
+      section: String(item.section || item.Section || '').trim().toUpperCase(),
+      courseTitle: String(item.courseTitle || item['Course Title'] || item.title || '').trim(),
+      division: String(item.division || item.Division || '').trim().toUpperCase(),
+      department: String(item.department || item.Department || '').trim().toUpperCase(),
+      campus: String(item.campus || item.Campus || '').trim().toUpperCase(),
+      building: String(item.building || item.Building || '').trim().toUpperCase(),
+      room: String(item.room || item.Room || '').trim().toUpperCase(),
+      startDate: String(item.startDate || item['Start Date'] || '').trim(),
+      endDate: String(item.endDate || item['End Date'] || '').trim(),
+      capacity: Number(item.capacity ?? item.Capacity ?? 0),
+      waitlist: Number(item.waitlist ?? item.Waitlist ?? 0),
+      uploadedAt: String(item.uploadedAt || item['Uploaded At'] || new Date().toISOString()).trim(),
+      batchId: String(item.batchId || item['Batch ID'] || '').trim(),
+      action: String(item.action || item.Action || '').trim()
+    };
+    if (!record.term || !record.crn || !record.snapshotType || !record.snapshotDate || !Number.isFinite(record.enrollment)) continue;
+    normalized.push(record);
+  }
+  return normalized;
+}
+
+function readEnrollmentSnapshots() {
+  if (!fs.existsSync(ENROLLMENT_SNAPSHOTS_PATH)) {
+    return { lastUpdated: null, data: [] };
+  }
+  const json = fs.readFileSync(ENROLLMENT_SNAPSHOTS_PATH, 'utf8');
+  const stats = fs.statSync(ENROLLMENT_SNAPSHOTS_PATH);
+  return {
+    lastUpdated: stats.mtime.toISOString(),
+    data: JSON.parse(json)
+  };
+}
+
+function writeEnrollmentSnapshots(records) {
+  fs.writeFileSync(ENROLLMENT_SNAPSHOTS_PATH, JSON.stringify(records, null, 2));
+}
+
 function safeFilename(name, fallback) {
   const clean = String(name || '').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 120);
   return clean || fallback;
@@ -449,6 +509,82 @@ app.post('/api/analytics-archive/:term', (req, res) => {
   } catch (err) {
     console.error('Analytics archive write error:', err);
     return res.status(500).json({ error: 'Analytics archive write failed' });
+  }
+});
+
+app.get('/api/enrollment-snapshots', (req, res) => {
+  try {
+    return res.json(readEnrollmentSnapshots());
+  } catch (err) {
+    console.error('Enrollment snapshot read error:', err);
+    return res.status(500).json({ error: 'Enrollment snapshot read failed' });
+  }
+});
+
+app.post('/api/enrollment-snapshots', (req, res) => {
+  const { records, password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const incoming = normalizeEnrollmentSnapshotRecords(records);
+  if (!incoming || !incoming.length) {
+    return res.status(400).json({ error: 'Enrollment snapshot records are required' });
+  }
+  try {
+    const existing = readEnrollmentSnapshots().data || [];
+    const merged = new Map();
+    existing.forEach(record => {
+      const key = snapshotKey(record);
+      if (key !== '||') merged.set(key, { ...record, action: record.action || 'Existing' });
+    });
+    let appended = 0;
+    let updated = 0;
+    incoming.forEach(record => {
+      const key = snapshotKey(record);
+      if (merged.has(key)) {
+        updated += 1;
+        merged.set(key, { ...merged.get(key), ...record, action: 'Updated' });
+      } else {
+        appended += 1;
+        merged.set(key, { ...record, action: 'Appended' });
+      }
+    });
+    const data = [...merged.values()].sort((a, b) =>
+      String(a.term).localeCompare(String(b.term), undefined, { numeric: true }) ||
+      String(a.snapshotType).localeCompare(String(b.snapshotType)) ||
+      String(a.crn).localeCompare(String(b.crn), undefined, { numeric: true })
+    );
+    writeEnrollmentSnapshots(data);
+    return res.json({ success: true, appended, updated, count: data.length, lastUpdated: new Date().toISOString(), data });
+  } catch (err) {
+    console.error('Enrollment snapshot write error:', err);
+    return res.status(500).json({ error: 'Enrollment snapshot write failed' });
+  }
+});
+
+app.delete('/api/enrollment-snapshots', (req, res) => {
+  const { term, snapshotType, snapshotDate, password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const termFilter = String(term || '').trim().toUpperCase();
+  const typeFilter = String(snapshotType || '').trim().toUpperCase();
+  const dateFilter = String(snapshotDate || '').trim();
+  if (!termFilter || !typeFilter || !dateFilter) {
+    return res.status(400).json({ error: 'Term, snapshot type, and snapshot date are required to clear a batch.' });
+  }
+  try {
+    const existing = readEnrollmentSnapshots().data || [];
+    const data = existing.filter(record =>
+      String(record.term || '').toUpperCase() !== termFilter ||
+      String(record.snapshotType || '').toUpperCase() !== typeFilter ||
+      String(record.snapshotDate || '') !== dateFilter
+    );
+    writeEnrollmentSnapshots(data);
+    return res.json({ success: true, removed: existing.length - data.length, count: data.length, lastUpdated: new Date().toISOString(), data });
+  } catch (err) {
+    console.error('Enrollment snapshot delete error:', err);
+    return res.status(500).json({ error: 'Enrollment snapshot delete failed' });
   }
 });
 
