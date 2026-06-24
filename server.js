@@ -580,8 +580,9 @@ app.delete('/api/enrollment-snapshots', (req, res) => {
       String(record.snapshotType || '').toUpperCase() !== typeFilter ||
       String(record.snapshotDate || '') !== dateFilter
     );
+    const deleted = existing.length - data.length;
     writeEnrollmentSnapshots(data);
-    return res.json({ success: true, removed: existing.length - data.length, count: data.length, lastUpdated: new Date().toISOString(), data });
+    return res.json({ success: true, deleted, removed: deleted, count: data.length, lastUpdated: new Date().toISOString(), data });
   } catch (err) {
     console.error('Enrollment snapshot delete error:', err);
     return res.status(500).json({ error: 'Enrollment snapshot delete failed' });
