@@ -13,8 +13,34 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CORS_ORIGIN)
   .map(origin => origin.trim())
   .filter(Boolean);
 const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
+const GENERAL_PASSWORD = process.env.GENERAL_PASSWORD || UPLOAD_PASSWORD;
+const DEAN_PASSWORD = process.env.DEAN_PASSWORD || '';
+const EM_PASSWORD = process.env.EM_PASSWORD || UPLOAD_PASSWORD;
+const DEV_PASSWORD = process.env.DEV_PASSWORD || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const ENROLLMENT_SESSION_TTL_MS = Number(process.env.ENROLLMENT_SESSION_TTL_MS || 30 * 60 * 1000);
 const enrollmentSessions = new Map();
+const ROLE_LEVEL = {
+  general: 1,
+  dean: 2,
+  em: 3,
+  development: 4,
+  admin: 5
+};
+const ROLE_LABEL = {
+  general: 'General',
+  dean: 'Dean / Division Chair',
+  em: 'Enrollment Management',
+  development: 'Development',
+  admin: 'Administrator'
+};
+const ROLE_PASSWORDS = [
+  ['admin', ADMIN_PASSWORD],
+  ['development', DEV_PASSWORD],
+  ['em', EM_PASSWORD],
+  ['dean', DEAN_PASSWORD],
+  ['general', GENERAL_PASSWORD]
+];
 
 // Enable CORS for your frontend
 app.use(cors({
@@ -88,20 +114,37 @@ function getAnalyticsArchivePath(term) {
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
-function isAuthorized(password) {
-  if (!UPLOAD_PASSWORD) return false;
+function passwordMatches(password, expectedPassword) {
+  if (!expectedPassword) return false;
   if (typeof password !== 'string') return false;
-  const expected = Buffer.from(UPLOAD_PASSWORD);
+  const expected = Buffer.from(expectedPassword);
   const supplied = Buffer.from(password);
   return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
 }
 
-function issueEnrollmentSession() {
+function isAuthorized(password) {
+  return passwordMatches(password, GENERAL_PASSWORD);
+}
+
+function authenticateRolePassword(password, minimumRole = 'general') {
+  const requiredLevel = ROLE_LEVEL[minimumRole] || ROLE_LEVEL.general;
+  for (const [role, expectedPassword] of ROLE_PASSWORDS) {
+    if (passwordMatches(password, expectedPassword) && ROLE_LEVEL[role] >= requiredLevel) {
+      return role;
+    }
+  }
+  return '';
+}
+
+function issueEnrollmentSession(role = 'em') {
   const token = crypto.randomBytes(32).toString('base64url');
   const expiresAtMs = Date.now() + ENROLLMENT_SESSION_TTL_MS;
-  enrollmentSessions.set(token, expiresAtMs);
+  enrollmentSessions.set(token, { expiresAtMs, role });
   return {
     token,
+    role,
+    roleLabel: ROLE_LABEL[role] || role,
+    roleLevel: ROLE_LEVEL[role] || 0,
     expiresAt: new Date(expiresAtMs).toISOString(),
     expiresInSeconds: Math.floor(ENROLLMENT_SESSION_TTL_MS / 1000)
   };
@@ -109,8 +152,9 @@ function issueEnrollmentSession() {
 
 function cleanupEnrollmentSessions() {
   const now = Date.now();
-  for (const [token, expiresAtMs] of enrollmentSessions.entries()) {
-    if (expiresAtMs <= now) enrollmentSessions.delete(token);
+  for (const [token, session] of enrollmentSessions.entries()) {
+    const expiresAtMs = typeof session === 'number' ? session : session?.expiresAtMs;
+    if (!expiresAtMs || expiresAtMs <= now) enrollmentSessions.delete(token);
   }
 }
 
@@ -124,7 +168,8 @@ function isEnrollmentSessionAuthorized(req) {
   cleanupEnrollmentSessions();
   const token = getBearerToken(req);
   if (!token) return false;
-  const expiresAtMs = enrollmentSessions.get(token);
+  const session = enrollmentSessions.get(token);
+  const expiresAtMs = typeof session === 'number' ? session : session?.expiresAtMs;
   if (!expiresAtMs || expiresAtMs <= Date.now()) {
     enrollmentSessions.delete(token);
     return false;
@@ -395,10 +440,21 @@ async function convertDocxToPdf(inputPath, outputDir) {
 
 app.post('/api/auth/enrollment-management', (req, res) => {
   const { password } = req.body || {};
-  if (!isAuthorized(password)) {
+  const role = authenticateRolePassword(password, 'em');
+  if (!role) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  return res.json(issueEnrollmentSession());
+  return res.json(issueEnrollmentSession(role));
+});
+
+app.post('/api/auth/role', (req, res) => {
+  const { password, requestedRole = 'general' } = req.body || {};
+  const minimumRole = ROLE_LEVEL[requestedRole] ? requestedRole : 'general';
+  const role = authenticateRolePassword(password, minimumRole);
+  if (!role) {
+    return res.status(403).json({ error: 'Unauthorized', requiredRole: minimumRole });
+  }
+  return res.json(issueEnrollmentSession(role));
 });
 
 // POST endpoint to upload schedule CSV

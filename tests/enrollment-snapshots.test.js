@@ -7,6 +7,11 @@ const test = require('node:test');
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-snapshots-'));
 process.env.DATA_DIR = dataDir;
 process.env.UPLOAD_PASSWORD = 'Upload2025';
+process.env.GENERAL_PASSWORD = 'GeneralSecret';
+process.env.DEAN_PASSWORD = 'DeanSecret';
+process.env.EM_PASSWORD = 'EmSecret';
+process.env.DEV_PASSWORD = 'DevSecret';
+process.env.ADMIN_PASSWORD = 'AdminSecret';
 
 const { app } = require('../server');
 
@@ -34,7 +39,7 @@ test('backend enrollment snapshot endpoints append, update, list, and delete sel
     const baseUrl = `http://127.0.0.1:${server.address().port}`;
     const auth = await jsonRequest(baseUrl, '/api/auth/enrollment-management', {
       method: 'POST',
-      body: JSON.stringify({ password: 'Upload2025' })
+      body: JSON.stringify({ password: 'EmSecret' })
     });
     assert.equal(auth.response.status, 200);
     assert.ok(auth.payload.token);
@@ -97,5 +102,49 @@ test('backend enrollment snapshot endpoints append, update, list, and delete sel
   } finally {
     await new Promise(resolve => server.close(resolve));
     fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('role authentication honors hierarchical password access', async () => {
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const cases = [
+      ['GeneralSecret', 'general', 'general'],
+      ['DeanSecret', 'general', 'dean'],
+      ['DeanSecret', 'dean', 'dean'],
+      ['EmSecret', 'dean', 'em'],
+      ['EmSecret', 'em', 'em'],
+      ['DevSecret', 'em', 'development'],
+      ['DevSecret', 'development', 'development'],
+      ['AdminSecret', 'development', 'admin'],
+      ['AdminSecret', 'admin', 'admin']
+    ];
+
+    for (const [password, requestedRole, expectedRole] of cases) {
+      const auth = await jsonRequest(baseUrl, '/api/auth/role', {
+        method: 'POST',
+        body: JSON.stringify({ password, requestedRole })
+      });
+      assert.equal(auth.response.status, 200, `${expectedRole} should unlock ${requestedRole}`);
+      assert.equal(auth.payload.role, expectedRole);
+      assert.ok(auth.payload.token);
+      assert.ok(auth.payload.roleLevel >= 1);
+    }
+
+    const deanDeniedForEm = await jsonRequest(baseUrl, '/api/auth/role', {
+      method: 'POST',
+      body: JSON.stringify({ password: 'DeanSecret', requestedRole: 'em' })
+    });
+    assert.equal(deanDeniedForEm.response.status, 403);
+
+    const emCompatibility = await jsonRequest(baseUrl, '/api/auth/enrollment-management', {
+      method: 'POST',
+      body: JSON.stringify({ password: 'EmSecret' })
+    });
+    assert.equal(emCompatibility.response.status, 200);
+    assert.equal(emCompatibility.payload.role, 'em');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
   }
 });
