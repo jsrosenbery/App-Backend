@@ -76,11 +76,15 @@ const CURRICULUM_CROSSWALK_PATH = path.join(DATA_DIR, 'curriculum-crosswalk.json
 const ENROLLMENT_SNAPSHOTS_PATH = path.join(DATA_DIR, 'enrollment-snapshots.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
+const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
 if (!fs.existsSync(ANALYTICS_ARCHIVE_DIR)) {
   fs.mkdirSync(ANALYTICS_ARCHIVE_DIR, { recursive: true });
+}
+if (!fs.existsSync(FACULTY_SCHEDULES_DIR)) {
+  fs.mkdirSync(FACULTY_SCHEDULES_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -111,6 +115,13 @@ function getAnalyticsArchivePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(ANALYTICS_ARCHIVE_DIR, `${term}.csv`);
   const dataRoot = path.resolve(ANALYTICS_ARCHIVE_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function getFacultySchedulePath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(FACULTY_SCHEDULES_DIR, `${term}.json`);
+  const dataRoot = path.resolve(FACULTY_SCHEDULES_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
@@ -175,6 +186,19 @@ function isEnrollmentSessionAuthorized(req) {
     return false;
   }
   return true;
+}
+
+function enrollmentSessionRole(req) {
+  cleanupEnrollmentSessions();
+  const token = getBearerToken(req);
+  if (!token) return '';
+  const session = enrollmentSessions.get(token);
+  const expiresAtMs = typeof session === 'number' ? session : session?.expiresAtMs;
+  if (!expiresAtMs || expiresAtMs <= Date.now()) {
+    enrollmentSessions.delete(token);
+    return '';
+  }
+  return typeof session === 'number' ? 'em' : session?.role || 'em';
 }
 
 function normalizeRoomCatalog(rooms) {
@@ -542,6 +566,181 @@ app.get('/api/analytics-archive/:term', (req, res) => {
   } catch (err) {
     console.error('Analytics archive read error:', err);
     return res.status(500).json({ error: 'Analytics archive read failed' });
+  }
+});
+
+function facultyField(row, names) {
+  if (!row || typeof row !== 'object') return '';
+  const entries = Object.entries(row);
+  for (const name of names) {
+    if (row[name] != null && String(row[name]).trim()) return String(row[name]).trim();
+    const normalizedName = String(name).replace(/[^a-z0-9]/gi, '').toLowerCase();
+    const found = entries.find(([key, value]) =>
+      String(key).replace(/[^a-z0-9]/gi, '').toLowerCase() === normalizedName &&
+      value != null &&
+      String(value).trim()
+    );
+    if (found) return String(found[1]).trim();
+  }
+  return '';
+}
+
+function validateFacultyScheduleRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return { valid: false, error: 'Faculty schedule rows are required.' };
+  }
+  const has = predicate => rows.some(predicate);
+  const missing = [];
+  if (!has(row => facultyField(row, ['FCNT_CODE', 'fcntCode']))) missing.push('FCNT_CODE');
+  if (!has(row => facultyField(row, ['FACULTYID', 'Faculty ID', 'facultyId']) || facultyField(row, ['FacultyName', 'Faculty Name', 'facultyName']))) missing.push('faculty identity');
+  if (!has(row => facultyField(row, ['CRN', 'crn']))) missing.push('CRN');
+  if (!has(row => facultyField(row, ['DAYS', 'Days', 'days']))) missing.push('DAYS');
+  if (!has(row => facultyField(row, ['STARTTIME', 'Start Time', 'startTime']))) missing.push('STARTTIME');
+  if (!has(row => facultyField(row, ['ENDTIME', 'End Time', 'endTime']))) missing.push('ENDTIME');
+  if (!has(row => facultyField(row, ['SCHD_CODE_SSRMEET', 'SCHD CODE SSRMEET', 'schdCode']))) missing.push('SCHD_CODE_SSRMEET');
+  if (missing.length) {
+    return {
+      valid: false,
+      error: 'This does not appear to be a Faculty Schedule file. Faculty schedules must include FCNT_CODE, faculty identity, CRN, days, times, and SCHD_CODE_SSRMEET.'
+    };
+  }
+  return { valid: true };
+}
+
+function facultyTypeFromCode(code) {
+  const normalized = String(code || '').trim().toUpperCase();
+  if (normalized === 'AE' || normalized === 'X') return 'OMIT';
+  if (normalized === 'FT' || normalized === 'TE') return 'FULL_TIME';
+  if (normalized === 'JP') return 'PART_TIME';
+  return normalized || 'UNKNOWN';
+}
+
+function meetingTypeFromCode(code) {
+  const normalized = String(code || '').replace(/\D/g, '') || String(code || '').trim().toUpperCase();
+  if (normalized === '2') return 'Lecture';
+  if (normalized === '4') return 'Lab';
+  if (String(code || '').trim().toUpperCase() === 'XX') return 'Activity';
+  return 'Other';
+}
+
+function facultyScheduleMetadata(term, rows, base = {}) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const facultyTypeCounts = {};
+  const meetingTypeCounts = {};
+  const faculty = new Set();
+  const crns = new Set();
+  const meetings = new Set();
+  let omittedRowCount = 0;
+  safeRows.forEach(row => {
+    const fcnt = facultyField(row, ['FCNT_CODE', 'fcntCode']);
+    const facultyType = facultyTypeFromCode(fcnt);
+    facultyTypeCounts[facultyType] = (facultyTypeCounts[facultyType] || 0) + 1;
+    if (facultyType === 'OMIT') omittedRowCount += 1;
+    const meetingType = meetingTypeFromCode(facultyField(row, ['SCHD_CODE_SSRMEET', 'SCHD CODE SSRMEET', 'schdCode']));
+    meetingTypeCounts[meetingType] = (meetingTypeCounts[meetingType] || 0) + 1;
+    const facultyId = facultyField(row, ['FACULTYID', 'Faculty ID', 'facultyId']) || facultyField(row, ['FacultyName', 'Faculty Name', 'facultyName']);
+    const crn = facultyField(row, ['CRN', 'crn']);
+    if (facultyId) faculty.add(facultyId.toUpperCase());
+    if (crn) crns.add(crn.toUpperCase());
+    meetings.add([
+      crn,
+      facultyId,
+      facultyField(row, ['DAYS', 'Days', 'days']),
+      facultyField(row, ['STARTTIME', 'Start Time', 'startTime']),
+      facultyField(row, ['ENDTIME', 'End Time', 'endTime']),
+      facultyField(row, ['SCHD_CODE_SSRMEET', 'SCHD CODE SSRMEET', 'schdCode'])
+    ].map(value => String(value || '').trim().toUpperCase()).join('|'));
+  });
+  return {
+    term,
+    uploadedAt: base.uploadedAt || new Date().toISOString(),
+    uploadedByRole: base.uploadedByRole || '',
+    sourceFileName: base.sourceFileName || '',
+    rawRowCount: safeRows.length,
+    normalizedMeetingCount: meetings.size,
+    omittedRowCount,
+    distinctFacultyCount: faculty.size,
+    distinctCrnCount: crns.size,
+    facultyTypeCounts,
+    meetingTypeCounts
+  };
+}
+
+function readFacultyScheduleArchive(term) {
+  const filePath = getFacultySchedulePath(term);
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+app.get('/api/faculty-schedules', (req, res) => {
+  try {
+    const data = fs.readdirSync(FACULTY_SCHEDULES_DIR)
+      .filter(file => file.toLowerCase().endsWith('.json'))
+      .map(file => {
+        const term = path.basename(file, '.json');
+        const payload = readFacultyScheduleArchive(term);
+        const stats = fs.statSync(path.join(FACULTY_SCHEDULES_DIR, file));
+        return payload?.metadata || { term, uploadedAt: stats.mtime.toISOString() };
+      })
+      .sort((a, b) => String(a.term || '').localeCompare(String(b.term || ''), undefined, { numeric: true }));
+    return res.json({ data });
+  } catch (err) {
+    console.error('Faculty schedule archive list error:', err);
+    return res.status(500).json({ error: 'Faculty schedule archive list failed' });
+  }
+});
+
+app.get('/api/faculty-schedules/:term', (req, res) => {
+  const term = req.params.term;
+  const filePath = getFacultySchedulePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  if (!fs.existsSync(filePath)) return res.json({ term, metadata: null, data: [] });
+  try {
+    const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return res.json({ term, metadata: payload.metadata || null, data: Array.isArray(payload.rows) ? payload.rows : [] });
+  } catch (err) {
+    console.error('Faculty schedule archive read error:', err);
+    return res.status(500).json({ error: 'Faculty schedule archive read failed' });
+  }
+});
+
+app.post('/api/faculty-schedules/:term', (req, res) => {
+  const term = req.params.term;
+  const { rows, password, sourceFileName = '' } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getFacultySchedulePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  const validation = validateFacultyScheduleRows(rows);
+  if (!validation.valid) return res.status(400).json({ error: validation.error });
+  try {
+    const metadata = facultyScheduleMetadata(term, rows, {
+      uploadedByRole: enrollmentSessionRole(req) || (isAuthorized(password) ? 'general' : ''),
+      sourceFileName
+    });
+    fs.writeFileSync(filePath, JSON.stringify({ metadata, rows }, null, 2));
+    return res.json({ success: true, term, metadata, data: rows });
+  } catch (err) {
+    console.error('Faculty schedule archive write error:', err);
+    return res.status(500).json({ error: 'Faculty schedule archive write failed' });
+  }
+});
+
+app.delete('/api/faculty-schedules/:term', (req, res) => {
+  const term = req.params.term;
+  const { password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getFacultySchedulePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return res.json({ success: true, term });
+  } catch (err) {
+    console.error('Faculty schedule archive delete error:', err);
+    return res.status(500).json({ error: 'Faculty schedule archive delete failed' });
   }
 });
 
