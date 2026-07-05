@@ -212,6 +212,45 @@ function normalizeRoomCatalog(rooms) {
     const type = String(item.type || item.Type || item.roomType || item['Room Type'] || '').trim();
     const rawCapacity = item.capacity ?? item.Capacity ?? item.cap ?? item.Cap;
     const capacity = rawCapacity === '' || rawCapacity == null ? null : Number(rawCapacity);
+    const rawPriorityDivision1 = roomCatalogField(item, [
+      'rawPriorityDivision1',
+      'priorityDivision1',
+      'Priority Division 1',
+      'Priority Division',
+      'Room Priority',
+      'Primary Division',
+      'Assigned Division',
+      'Preferred Division',
+      'Dean Area',
+      'Priority Area',
+      'priority',
+      'roomPriority'
+    ]);
+    const rawPriorityDivision2 = roomCatalogField(item, [
+      'rawPriorityDivision2',
+      'priorityDivision2',
+      'Priority Division 2',
+      'Secondary Division',
+      'Secondary Priority',
+      'Priority 2',
+      'Room Priority 2',
+      'Room Priority_2'
+    ]);
+    const rawRoomFeatures = roomCatalogField(item, [
+      'rawRoomFeatures',
+      'roomFeaturesText',
+      'roomFeatures',
+      'Room Features',
+      'Features',
+      'Preferred Room Features',
+      'Technology Features',
+      'Instructional Features',
+      'Equipment',
+      'Notes'
+    ]);
+    const priorityDivision1 = normalizeRoomPriorityDivision(rawPriorityDivision1, 'Unassigned');
+    const priorityDivision2 = normalizeRoomPriorityDivision(rawPriorityDivision2, 'None');
+    const roomFeatures = normalizeRoomFeatures(rawRoomFeatures);
     if (!building || !room) continue;
     normalized.push({
       campus,
@@ -219,10 +258,45 @@ function normalizeRoomCatalog(rooms) {
       room,
       buildingRoom: `${building}-${room}`,
       type,
-      capacity: Number.isFinite(capacity) ? capacity : null
+      capacity: Number.isFinite(capacity) ? capacity : null,
+      rawPriorityDivision1: String(rawPriorityDivision1 || '').trim(),
+      rawPriorityDivision2: String(rawPriorityDivision2 || '').trim(),
+      priorityDivision1,
+      priorityDivision2,
+      priority: priorityDivision1,
+      rawRoomFeatures: String(rawRoomFeatures || '').trim(),
+      roomFeatures,
+      roomFeaturesText: roomFeatures.join('; ')
     });
   }
   return normalized;
+}
+
+function roomCatalogField(item, names) {
+  for (const name of names) {
+    const value = item?.[name];
+    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+  }
+  const normalizeKey = value => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const aliases = new Set(names.map(normalizeKey));
+  for (const [key, value] of Object.entries(item || {})) {
+    if (aliases.has(normalizeKey(key)) && value !== undefined && value !== null && String(value).trim() !== '') return value;
+  }
+  return '';
+}
+
+function normalizeRoomPriorityDivision(value, blankValue) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return blankValue;
+  return text.toUpperCase() === 'ADMINISTRATION' ? 'Administration' : text;
+}
+
+function normalizeRoomFeatures(value) {
+  const text = Array.isArray(value) ? value.join('; ') : String(value || '');
+  return text
+    .split(/[;,]/)
+    .map(item => item.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
 }
 
 function normalizeModalityDefinitions(definitions) {
