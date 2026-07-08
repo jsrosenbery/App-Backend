@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: app-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/export-capabilities
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LIBREOFFICE_PATH
+        value: /usr/bin/soffice
+      - key: DATA_DIR
+        value: /var/data/cos-app
+    disk:
+      name: cos-app-data
+      mountPath: /var/data
+      sizeGB: 1

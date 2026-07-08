@@ -4,7 +4,8 @@ const path = require('path');
 const cors = require('cors');
 const Papa = require('papaparse');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { execFile, spawnSync } = require('child_process');
+const { pathToFileURL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://cos-app.vercel.app';
@@ -75,6 +76,17 @@ const CAL_GETC_MAPPING_PATH = path.join(DATA_DIR, 'cal-getc-mapping.json');
 const CURRICULUM_CROSSWALK_PATH = path.join(DATA_DIR, 'curriculum-crosswalk.json');
 const ENROLLMENT_SNAPSHOTS_PATH = path.join(DATA_DIR, 'enrollment-snapshots.json');
 const CONVERT_DIR = path.join(DATA_DIR, 'conversions');
+const MAX_DOCX_CONVERSION_BYTES = Number(process.env.MAX_DOCX_CONVERSION_BYTES || 15 * 1024 * 1024);
+const PDF_CONVERSION_UNAVAILABLE_MESSAGE = 'PDF conversion is unavailable on the server. Please export DOCX and save as PDF from Word.';
+const DOCX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const EMAIL_PROVIDER = String(process.env.SCHEDULE_CHANGE_EMAIL_PROVIDER || process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+const MICROSOFT_GRAPH_DRAFT_SUPPORTED = /^true$/i.test(String(process.env.MICROSOFT_GRAPH_DRAFT_ENABLED || process.env.SCHEDULE_CHANGE_GRAPH_DRAFT_ENABLED || ''));
+const DIRECT_BACKEND_SEND_SUPPORTED = /^true$/i.test(String(process.env.SCHEDULE_CHANGE_DIRECT_SEND_ENABLED || '')) && Boolean(EMAIL_PROVIDER);
+const EMAIL_AUDIT_LOG_PATH = path.join(DATA_DIR, 'schedule-change-email-audit.jsonl');
+const MAX_EMAIL_PAYLOAD_BYTES = Number(process.env.MAX_SCHEDULE_CHANGE_EMAIL_BYTES || 20 * 1024 * 1024);
+const EMAIL_RATE_LIMIT_WINDOW_MS = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_WINDOW_MS || 15 * 60 * 1000);
+const EMAIL_RATE_LIMIT_MAX = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_MAX || 20);
+const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 if (!fs.existsSync(CONVERT_DIR)) {
@@ -490,51 +502,534 @@ function writeEnrollmentSnapshots(records) {
 }
 
 function safeFilename(name, fallback) {
-  const clean = String(name || '').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 120);
+  const clean = String(name || '').replace(/[^a-z0-9_. -]/gi, '_').replace(/\s+/g, ' ').trim().slice(0, 120);
   return clean || fallback;
 }
 
+function contentDispositionFilename(filename) {
+  return String(filename || 'download.pdf').replace(/["\r\n]/g, '_');
+}
+
 function runCommand(command, args, options = {}) {
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     execFile(command, args, options, (error, stdout, stderr) => {
+      const result = {
+        command,
+        args,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || ''),
+        exitCode: error?.code ?? 0,
+        signal: error?.signal || null,
+        durationMs: Date.now() - startedAt
+      };
       if (error) {
-        error.stdout = stdout;
-        error.stderr = stderr;
+        error.stdout = result.stdout;
+        error.stderr = result.stderr;
+        error.exitCode = result.exitCode;
+        error.signal = result.signal;
+        error.durationMs = result.durationMs;
+        error.commandResult = result;
         reject(error);
         return;
       }
-      resolve({ stdout, stderr });
+      resolve(result);
     });
   });
 }
 
-async function convertDocxToPdf(inputPath, outputDir) {
+function detectDocxPdfConverter(options = {}) {
   const commands = [
-    process.env.LIBREOFFICE_PATH,
+    options.libreOfficePath || process.env.LIBREOFFICE_PATH,
     'soffice',
     'libreoffice'
   ].filter(Boolean);
-  let lastError = null;
+  const attempts = [];
   for (const command of commands) {
+    const result = spawnSync(command, ['--version'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5000
+    });
+    const versionOutput = String(`${result.stdout || ''} ${result.stderr || ''}`).trim();
+    attempts.push({
+      command,
+      exitCode: result.status,
+      error: result.error?.message || '',
+      stdout: String(result.stdout || '').trim(),
+      stderr: String(result.stderr || '').trim()
+    });
+    if (!result.error && result.status === 0) {
+      const version = versionOutput || 'Version unavailable';
+      return {
+        available: true,
+        command,
+        installed: true,
+        converter: /libreoffice/i.test(`${result.stdout} ${result.stderr}`) ? 'libreoffice' : command,
+        version,
+        reason: '',
+        attempts,
+        notes: [`DOCX-to-PDF conversion available through ${command}.`, `LibreOffice version: ${version}`]
+      };
+    }
+  }
+  const reason = attempts.length
+    ? `LibreOffice/soffice was not found or could not run. Attempts: ${attempts.map(item => `${item.command}${item.error ? ` (${item.error})` : item.exitCode == null ? '' : ` (exit ${item.exitCode})`}`).join('; ')}`
+    : 'LibreOffice/soffice was not configured.';
+  console.error(`DOCX-to-PDF conversion unavailable: ${reason}`);
+  return {
+    available: false,
+    command: '',
+    installed: false,
+    converter: 'unavailable',
+    version: '',
+    reason,
+    attempts,
+    notes: [PDF_CONVERSION_UNAVAILABLE_MESSAGE, reason]
+  };
+}
+
+const DOCX_PDF_CAPABILITY = detectDocxPdfConverter();
+console.log('[DOCX-PDF] Startup converter diagnostics:', JSON.stringify({
+  available: DOCX_PDF_CAPABILITY.available,
+  installed: DOCX_PDF_CAPABILITY.installed,
+  command: DOCX_PDF_CAPABILITY.command,
+  version: DOCX_PDF_CAPABILITY.version,
+  reason: DOCX_PDF_CAPABILITY.reason || ''
+}));
+
+async function convertDocxToPdf(inputPath, outputDir, options = {}) {
+  const commands = options.commands || (DOCX_PDF_CAPABILITY.available
+    ? [DOCX_PDF_CAPABILITY.command]
+    : [process.env.LIBREOFFICE_PATH, 'soffice', 'libreoffice'].filter(Boolean));
+  let lastError = null;
+  const attempts = [];
+  for (const commandConfig of commands) {
+    const command = typeof commandConfig === 'string' ? commandConfig : commandConfig.command;
+    const argsPrefix = typeof commandConfig === 'string' ? [] : (commandConfig.argsPrefix || []);
+    const profileDir = path.join(outputDir, 'lo-profile');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const args = [
+      ...argsPrefix,
+      '--headless',
+      '--nologo',
+      '--nofirststartwizard',
+      '--nodefault',
+      '--nolockcheck',
+      `-env:UserInstallation=${pathToFileURL(profileDir).href}`,
+      '--convert-to',
+      'pdf',
+      '--outdir',
+      outputDir,
+      inputPath
+    ];
+    console.log('[DOCX-PDF] Conversion command:', JSON.stringify({ command, args }));
     try {
-      await runCommand(command, [
-        '--headless',
-        '--convert-to',
-        'pdf',
-        '--outdir',
-        outputDir,
-        inputPath
-      ], { timeout: 30000 });
+      const result = await runCommand(command, args, { timeout: 60000, windowsHide: true });
+      attempts.push(result);
+      console.log('[DOCX-PDF] Conversion result:', JSON.stringify({
+        command,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        stdout: result.stdout,
+        stderr: result.stderr
+      }));
       const outputPath = path.join(outputDir, `${path.basename(inputPath, path.extname(inputPath))}.pdf`);
-      if (fs.existsSync(outputPath)) return outputPath;
+      if (fs.existsSync(outputPath)) {
+        return { outputPath, attempts };
+      }
       lastError = new Error('LibreOffice finished without producing a PDF.');
+      lastError.commandResult = result;
     } catch (err) {
       lastError = err;
+      attempts.push(err.commandResult || {
+        command,
+        args,
+        stdout: String(err.stdout || ''),
+        stderr: String(err.stderr || ''),
+        exitCode: err.exitCode ?? err.code ?? null,
+        signal: err.signal || null,
+        durationMs: err.durationMs || 0
+      });
+      console.error('[DOCX-PDF] Conversion failed:', JSON.stringify({
+        command,
+        exitCode: err.exitCode ?? err.code ?? null,
+        durationMs: err.durationMs || 0,
+        stdout: err.stdout || '',
+        stderr: err.stderr || '',
+        message: err.message || ''
+      }));
     }
   }
   const detail = lastError?.stderr || lastError?.message || 'LibreOffice/soffice was not found.';
-  throw new Error(`DOCX-to-PDF converter unavailable or failed. ${detail}`);
+  const err = new Error(`DOCX-to-PDF converter unavailable or failed. ${detail}`);
+  err.attempts = attempts;
+  throw err;
 }
+
+function exportCapabilities() {
+  return {
+    docxExport: true,
+    pdfFromDocx: Boolean(DOCX_PDF_CAPABILITY.available),
+    libreOfficeInstalled: Boolean(DOCX_PDF_CAPABILITY.installed),
+    libreOfficePath: DOCX_PDF_CAPABILITY.command || '',
+    libreOfficeVersion: DOCX_PDF_CAPABILITY.version || '',
+    pdfConversionAvailable: Boolean(DOCX_PDF_CAPABILITY.available),
+    pdfConversionUnavailableReason: DOCX_PDF_CAPABILITY.available ? '' : DOCX_PDF_CAPABILITY.reason,
+    converter: DOCX_PDF_CAPABILITY.converter,
+    emailDraftSupported: true,
+    microsoftGraphDraftSupported: MICROSOFT_GRAPH_DRAFT_SUPPORTED,
+    mailtoFallbackSupported: true,
+    directBackendSendSupported: DIRECT_BACKEND_SEND_SUPPORTED,
+    emailDelivery: {
+      draftSupported: true,
+      graphDraft: MICROSOFT_GRAPH_DRAFT_SUPPORTED,
+      mailto: true,
+      backendSend: DIRECT_BACKEND_SEND_SUPPORTED,
+      directBackendSend: DIRECT_BACKEND_SEND_SUPPORTED,
+      provider: EMAIL_PROVIDER || 'unavailable',
+      attachments: MICROSOFT_GRAPH_DRAFT_SUPPORTED || DIRECT_BACKEND_SEND_SUPPORTED,
+      notes: [
+        MICROSOFT_GRAPH_DRAFT_SUPPORTED
+          ? 'Microsoft 365 draft creation is configured.'
+          : 'Microsoft 365 draft creation is not configured. Use the mailto fallback.',
+        DIRECT_BACKEND_SEND_SUPPORTED
+          ? `Legacy backend direct-send scaffold enabled for ${EMAIL_PROVIDER}.`
+          : 'Direct backend sending is disabled by default.'
+      ]
+    },
+    notes: DOCX_PDF_CAPABILITY.notes
+  };
+}
+
+function diagnosticsPayload() {
+  return {
+    nodeVersion: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    render: Boolean(process.env.RENDER),
+    dataDir: DATA_DIR,
+    tempConversionDir: CONVERT_DIR,
+    libreOfficeInstalled: Boolean(DOCX_PDF_CAPABILITY.installed),
+    libreOfficePath: DOCX_PDF_CAPABILITY.command || '',
+    libreOfficeVersion: DOCX_PDF_CAPABILITY.version || '',
+    pdfConversionAvailable: Boolean(DOCX_PDF_CAPABILITY.available),
+    pdfConversionUnavailableReason: DOCX_PDF_CAPABILITY.available ? '' : DOCX_PDF_CAPABILITY.reason,
+    converterAttempts: DOCX_PDF_CAPABILITY.attempts || []
+  };
+}
+
+function normalizeEmailList(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(/[;,]/);
+  return list.map(item => String(item || '').trim()).filter(Boolean);
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function validateScheduleChangeEmailPayload(payload) {
+  const recipients = normalizeEmailList(payload.recipients || payload.to);
+  const cc = normalizeEmailList(payload.cc);
+  const bcc = normalizeEmailList(payload.bcc);
+  const all = [...recipients, ...cc, ...bcc];
+  if (!recipients.length) {
+    const err = new Error('At least one recipient is required.');
+    err.status = 400;
+    throw err;
+  }
+  const invalid = all.filter(email => !isValidEmail(email));
+  if (invalid.length) {
+    const err = new Error(`Invalid email address: ${invalid[0]}`);
+    err.status = 400;
+    throw err;
+  }
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  const totalAttachmentBytes = attachments.reduce((total, item) => {
+    const base64 = String(item?.contentBase64 || '');
+    return total + Math.ceil(base64.length * 3 / 4);
+  }, 0);
+  if (totalAttachmentBytes > MAX_EMAIL_PAYLOAD_BYTES) {
+    const err = new Error(`Email attachments exceed the ${MAX_EMAIL_PAYLOAD_BYTES} byte limit.`);
+    err.status = 413;
+    throw err;
+  }
+  attachments.forEach(item => {
+    const filename = safeFilename(item?.filename, '');
+    if (!/\.(docx|pdf)$/i.test(filename)) {
+      const err = new Error('Only DOCX and PDF Schedule Change Form attachments are allowed.');
+      err.status = 400;
+      throw err;
+    }
+    if (!String(item?.contentBase64 || '').trim()) {
+      const err = new Error(`Attachment ${filename || '(unnamed)'} is missing content.`);
+      err.status = 400;
+      throw err;
+    }
+  });
+  return {
+    recipients,
+    cc,
+    bcc,
+    subject: String(payload.subject || '').trim() || 'Schedule Change Request',
+    body: String(payload.body || '').trim(),
+    attachments,
+    metadata: payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {}
+  };
+}
+
+function checkEmailRateLimit(req) {
+  const key = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  const now = Date.now();
+  const bucket = emailRateLimit.get(key) || [];
+  const recent = bucket.filter(timestamp => now - timestamp < EMAIL_RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= EMAIL_RATE_LIMIT_MAX) {
+    const err = new Error('Too many email send attempts. Please wait and try again.');
+    err.status = 429;
+    throw err;
+  }
+  recent.push(now);
+  emailRateLimit.set(key, recent);
+}
+
+function appendEmailAudit(entry) {
+  fs.appendFileSync(EMAIL_AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`);
+}
+
+async function sendScheduleChangeEmail(_email) {
+  const err = new Error(`Schedule Change backend email provider "${EMAIL_PROVIDER}" is not implemented in this deployment.`);
+  err.status = 501;
+  throw err;
+}
+
+async function createScheduleChangeEmailDraft(_email) {
+  const err = new Error('Microsoft 365 draft creation is not configured. Opening local email draft instead.');
+  err.status = 503;
+  throw err;
+}
+
+app.post('/api/schedule-change/create-email-draft', (req, res) => {
+  const timestamp = new Date().toISOString();
+  let audit = {
+    timestamp,
+    provider: MICROSOFT_GRAPH_DRAFT_SUPPORTED ? 'microsoft-graph' : 'unavailable',
+    mode: 'draft',
+    status: 'received'
+  };
+  try {
+    checkEmailRateLimit(req);
+    if (!MICROSOFT_GRAPH_DRAFT_SUPPORTED) {
+      audit.status = 'disabled';
+      audit.error = 'Microsoft 365 draft creation is not configured.';
+      appendEmailAudit(audit);
+      return res.status(503).json({
+        success: false,
+        error: 'Microsoft 365 draft creation is not configured. Opening local email draft instead.'
+      });
+    }
+    const email = validateScheduleChangeEmailPayload(req.body || {});
+    audit = {
+      ...audit,
+      recipients: email.recipients,
+      ccCount: email.cc.length,
+      bccCount: email.bcc.length,
+      subject: email.subject,
+      term: email.metadata.term || '',
+      crn: email.metadata.crn || '',
+      course: email.metadata.course || '',
+      attachmentFilenames: email.attachments.map(item => safeFilename(item.filename, 'attachment'))
+    };
+    return createScheduleChangeEmailDraft(email)
+      .then(result => {
+        audit.status = 'draft-created';
+        audit.providerMessageId = result?.messageId || '';
+        appendEmailAudit(audit);
+        return res.json({ success: true, providerMessageId: audit.providerMessageId, webLink: result?.webLink || '' });
+      })
+      .catch(err => {
+        audit.status = 'failed';
+        audit.error = err.message || 'Email draft creation failed.';
+        appendEmailAudit(audit);
+        return res.status(err.status || 500).json({ success: false, error: audit.error });
+      });
+  } catch (err) {
+    audit.status = 'rejected';
+    audit.error = err.message || 'Email draft request rejected.';
+    appendEmailAudit(audit);
+    return res.status(err.status || 400).json({ success: false, error: audit.error });
+  }
+});
+
+app.post('/api/schedule-change/send-email', (req, res) => {
+  const timestamp = new Date().toISOString();
+  let audit = {
+    timestamp,
+    provider: EMAIL_PROVIDER || 'unavailable',
+    status: 'received'
+  };
+  try {
+    checkEmailRateLimit(req);
+    if (!DIRECT_BACKEND_SEND_SUPPORTED) {
+      audit.status = 'disabled';
+      audit.error = 'Direct backend sending is disabled.';
+      appendEmailAudit(audit);
+      return res.status(503).json({
+        success: false,
+        error: 'Direct backend sending is disabled. Use Open Email Draft or download the DOCX/PDF and send manually.'
+      });
+    }
+    const email = validateScheduleChangeEmailPayload(req.body || {});
+    audit = {
+      ...audit,
+      recipients: email.recipients,
+      ccCount: email.cc.length,
+      bccCount: email.bcc.length,
+      subject: email.subject,
+      term: email.metadata.term || '',
+      crn: email.metadata.crn || '',
+      course: email.metadata.course || '',
+      user: email.metadata.user || '',
+      attachmentFilenames: email.attachments.map(item => safeFilename(item.filename, 'attachment'))
+    };
+    return sendScheduleChangeEmail(email)
+      .then(result => {
+        audit.status = 'sent';
+        audit.providerMessageId = result?.messageId || '';
+        appendEmailAudit(audit);
+        return res.json({ success: true, providerMessageId: audit.providerMessageId });
+      })
+      .catch(err => {
+        audit.status = 'failed';
+        audit.error = err.message || 'Email send failed.';
+        appendEmailAudit(audit);
+        return res.status(err.status || 500).json({ success: false, error: audit.error });
+      });
+  } catch (err) {
+    audit.status = 'rejected';
+    audit.error = err.message || 'Email request rejected.';
+    appendEmailAudit(audit);
+    return res.status(err.status || 400).json({ success: false, error: audit.error });
+  }
+});
+
+function cleanupConversionDir(requestDir) {
+  try {
+    fs.rmSync(requestDir, { recursive: true, force: true });
+    const removed = !fs.existsSync(requestDir);
+    console.log('[DOCX-PDF] Cleanup status:', JSON.stringify({ requestDir, removed }));
+    return { ok: removed, message: removed ? 'Temporary conversion directory removed.' : 'Temporary conversion directory still exists after cleanup.' };
+  } catch (cleanupErr) {
+    console.error('Conversion cleanup error:', cleanupErr);
+    return { ok: false, message: cleanupErr.message || 'Cleanup failed.' };
+  }
+}
+
+function decodeDocxPayload(req) {
+  const isBinaryDocx = Buffer.isBuffer(req.body);
+  const filename = isBinaryDocx
+    ? req.get('x-filename') || req.query?.filename || 'schedule-change-form.docx'
+    : req.body?.filename;
+  const inputName = safeFilename(filename, 'schedule-change-form.docx').replace(/\.pdf$/i, '.docx');
+  if (!/\.docx$/i.test(inputName)) {
+    const err = new Error('Invalid file type. Schedule Change PDF conversion requires a .docx file.');
+    err.status = 400;
+    throw err;
+  }
+  if (!isBinaryDocx && (typeof req.body?.docxBase64 !== 'string' || !req.body.docxBase64.trim())) {
+    const err = new Error('DOCX payload is required.');
+    err.status = 400;
+    throw err;
+  }
+  const buffer = isBinaryDocx ? req.body : Buffer.from(req.body.docxBase64, 'base64');
+  if (!buffer.length || buffer.length > MAX_DOCX_CONVERSION_BYTES) {
+    const err = new Error(`DOCX payload must be between 1 byte and ${MAX_DOCX_CONVERSION_BYTES} bytes.`);
+    err.status = 413;
+    throw err;
+  }
+  if (buffer[0] !== 0x50 || buffer[1] !== 0x4b) {
+    const err = new Error('Invalid DOCX payload. Expected a DOCX/ZIP file.');
+    err.status = 400;
+    throw err;
+  }
+  return { inputName, buffer };
+}
+
+async function handleScheduleChangeDocxToPdf(req, res) {
+  if (!DOCX_PDF_CAPABILITY.available) {
+    return res.status(503).json({
+      error: PDF_CONVERSION_UNAVAILABLE_MESSAGE,
+      reason: DOCX_PDF_CAPABILITY.reason,
+      capabilities: exportCapabilities()
+    });
+  }
+
+  const requestId = crypto.randomBytes(12).toString('hex');
+  const requestDir = path.join(CONVERT_DIR, requestId);
+  fs.mkdirSync(requestDir, { recursive: true });
+  const startedAt = Date.now();
+  console.log('[DOCX-PDF] Conversion request started:', JSON.stringify({ requestId, requestDir }));
+
+  try {
+    const { inputName, buffer } = decodeDocxPayload(req);
+    const inputPath = path.join(requestDir, inputName);
+    fs.writeFileSync(inputPath, buffer, { flag: 'wx' });
+    const { outputPath: pdfPath, attempts } = await convertDocxToPdf(inputPath, requestDir);
+    const downloadName = path.basename(inputPath, path.extname(inputPath)) + '.pdf';
+    console.log('[DOCX-PDF] Conversion request completed:', JSON.stringify({
+      requestId,
+      inputName,
+      outputName: downloadName,
+      durationMs: Date.now() - startedAt,
+      attempts: attempts.map(item => ({
+        command: item.command,
+        exitCode: item.exitCode,
+        durationMs: item.durationMs,
+        stdout: item.stdout,
+        stderr: item.stderr
+      }))
+    }));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${contentDispositionFilename(downloadName)}"`);
+    return res.sendFile(pdfPath, err => {
+      const cleanup = cleanupConversionDir(requestDir);
+      console.log('[DOCX-PDF] Response cleanup:', JSON.stringify({ requestId, cleanup }));
+      if (err) console.error('PDF send error:', err);
+    });
+  } catch (err) {
+    const cleanup = cleanupConversionDir(requestDir);
+    const status = err.status || 500;
+    if (status >= 500) {
+      console.error('DOCX conversion error:', JSON.stringify({
+        requestId,
+        status,
+        message: err.message || '',
+        durationMs: Date.now() - startedAt,
+        cleanup,
+        attempts: (err.attempts || []).map(item => ({
+          command: item.command,
+          exitCode: item.exitCode,
+          durationMs: item.durationMs,
+          stdout: item.stdout,
+          stderr: item.stderr
+        }))
+      }));
+    }
+    return res.status(status).json({
+      error: status === 503 ? PDF_CONVERSION_UNAVAILABLE_MESSAGE : (err.message || 'DOCX-to-PDF conversion failed'),
+      reason: err.message || DOCX_PDF_CAPABILITY.reason || '',
+      cleanup,
+      attempts: err.attempts || []
+    });
+  }
+}
+
+app.get('/api/export-capabilities', (_req, res) => {
+  return res.json(exportCapabilities());
+});
+
+app.get('/api/admin/diagnostics', (_req, res) => {
+  return res.json(diagnosticsPayload());
+});
 
 app.post('/api/auth/enrollment-management', (req, res) => {
   const { password } = req.body || {};
@@ -1043,45 +1538,22 @@ app.post('/api/curriculum-crosswalk/import', (req, res) => {
   }
 });
 
-app.post('/api/convert/docx-to-pdf', async (req, res) => {
-  const { filename, docxBase64 } = req.body || {};
-  if (typeof docxBase64 !== 'string' || !docxBase64.trim()) {
-    return res.status(400).send('DOCX payload is required');
-  }
-
-  const requestId = crypto.randomBytes(8).toString('hex');
-  const requestDir = path.join(CONVERT_DIR, requestId);
-  fs.mkdirSync(requestDir, { recursive: true });
-  const inputName = safeFilename(filename, 'schedule-change-form.docx').replace(/\.pdf$/i, '.docx');
-  const inputPath = path.join(requestDir, inputName.toLowerCase().endsWith('.docx') ? inputName : `${inputName}.docx`);
-
-  try {
-    fs.writeFileSync(inputPath, Buffer.from(docxBase64, 'base64'));
-    const pdfPath = await convertDocxToPdf(inputPath, requestDir);
-    const downloadName = path.basename(inputPath, path.extname(inputPath)) + '.pdf';
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-    return res.sendFile(pdfPath, err => {
-      try {
-        fs.rmSync(requestDir, { recursive: true, force: true });
-      } catch (cleanupErr) {
-        console.error('Conversion cleanup error:', cleanupErr);
-      }
-      if (err) console.error('PDF send error:', err);
-    });
-  } catch (err) {
-    try {
-      fs.rmSync(requestDir, { recursive: true, force: true });
-    } catch (cleanupErr) {
-      console.error('Conversion cleanup error:', cleanupErr);
-    }
-    console.error('DOCX conversion error:', err);
-    return res.status(500).send(err.message || 'DOCX-to-PDF conversion failed');
-  }
-});
+const docxRawParser = express.raw({ type: DOCX_MIME_TYPE, limit: MAX_DOCX_CONVERSION_BYTES });
+app.post('/api/schedule-change/convert-docx-to-pdf', docxRawParser, handleScheduleChangeDocxToPdf);
+app.post('/api/convert/docx-to-pdf', docxRawParser, handleScheduleChangeDocxToPdf);
 
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
 }
 
-module.exports = { app };
+module.exports = {
+  app,
+  detectDocxPdfConverter,
+  exportCapabilities,
+  diagnosticsPayload,
+  safeFilename,
+  contentDispositionFilename,
+  cleanupConversionDir,
+  convertDocxToPdf,
+  runCommand
+};

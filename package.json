@@ -1,10 +1,11 @@
 {
-  "name": "cos-schedule-backend",
+  "name": "cos-app-backend",
   "version": "1.0.0",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/enrollment-snapshots.test.js"
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
