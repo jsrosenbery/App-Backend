@@ -541,6 +541,10 @@ function runCommand(command, args, options = {}) {
 function detectDocxPdfConverter(options = {}) {
   const commands = [
     options.libreOfficePath || process.env.LIBREOFFICE_PATH,
+    '/usr/bin/soffice',
+    '/usr/bin/libreoffice',
+    '/usr/local/bin/soffice',
+    '/usr/local/bin/libreoffice',
     'soffice',
     'libreoffice'
   ].filter(Boolean);
@@ -601,7 +605,15 @@ console.log('[DOCX-PDF] Startup converter diagnostics:', JSON.stringify({
 async function convertDocxToPdf(inputPath, outputDir, options = {}) {
   const commands = options.commands || (DOCX_PDF_CAPABILITY.available
     ? [DOCX_PDF_CAPABILITY.command]
-    : [process.env.LIBREOFFICE_PATH, 'soffice', 'libreoffice'].filter(Boolean));
+    : [
+        process.env.LIBREOFFICE_PATH,
+        '/usr/bin/soffice',
+        '/usr/bin/libreoffice',
+        '/usr/local/bin/soffice',
+        '/usr/local/bin/libreoffice',
+        'soffice',
+        'libreoffice'
+      ].filter(Boolean));
   let lastError = null;
   const attempts = [];
   for (const commandConfig of commands) {
