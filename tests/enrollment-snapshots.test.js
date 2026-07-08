@@ -4,7 +4,9 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-snapshots-'));
+const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-snapshots-'));
+const dataDir = path.join(dataRoot, 'cos-app');
+fs.mkdirSync(dataDir, { recursive: true });
 process.env.DATA_DIR = dataDir;
 process.env.UPLOAD_PASSWORD = 'Upload2025';
 process.env.GENERAL_PASSWORD = 'GeneralSecret';
@@ -12,8 +14,9 @@ process.env.DEAN_PASSWORD = 'DeanSecret';
 process.env.EM_PASSWORD = 'EmSecret';
 process.env.DEV_PASSWORD = 'DevSecret';
 process.env.ADMIN_PASSWORD = 'AdminSecret';
+process.env.MIGRATION_TOKEN = 'MigrationSecret';
 
-const { app } = require('../server');
+const { app, validateMigrationArchiveEntries } = require('../server');
 
 function listen() {
   return new Promise(resolve => {
@@ -147,4 +150,35 @@ test('role authentication honors hierarchical password access', async () => {
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
+});
+
+test('temporary migration endpoints require token and report data status', async () => {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'rooms.json'), JSON.stringify([{ building: 'A', room: '1' }]));
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const denied = await fetch(`${baseUrl}/admin/migration/status`);
+    assert.equal(denied.status, 403);
+
+    const allowed = await fetch(`${baseUrl}/admin/migration/status`, {
+      headers: { 'x-migration-token': 'MigrationSecret' }
+    });
+    assert.equal(allowed.status, 200);
+    const payload = await allowed.json();
+    assert.equal(payload.temporaryMigrationOnly, true);
+    assert.equal(payload.exists, true);
+    assert.ok(payload.diskUsage.files >= 1);
+    assert.ok(payload.topLevelEntries.some(entry => entry.name === 'rooms.json'));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('migration archive validation rejects unsafe archive paths', () => {
+  assert.equal(validateMigrationArchiveEntries(['cos-app/', 'cos-app/rooms.json']).valid, true);
+  assert.equal(validateMigrationArchiveEntries(['/cos-app/rooms.json']).valid, false);
+  assert.equal(validateMigrationArchiveEntries(['cos-app/../evil.txt']).valid, false);
+  assert.equal(validateMigrationArchiveEntries(['other/rooms.json']).valid, false);
+  assert.equal(validateMigrationArchiveEntries([]).valid, false);
 });
