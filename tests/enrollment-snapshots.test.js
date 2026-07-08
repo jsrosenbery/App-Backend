@@ -16,7 +16,7 @@ process.env.DEV_PASSWORD = 'DevSecret';
 process.env.ADMIN_PASSWORD = 'AdminSecret';
 process.env.MIGRATION_TOKEN = 'MigrationSecret';
 
-const { app, validateMigrationArchiveEntries } = require('../server');
+const { app, validateMigrationArchiveEntries, MIGRATION_IMPORT_TMP_DIR } = require('../server');
 
 function listen() {
   return new Promise(resolve => {
@@ -181,4 +181,9 @@ test('migration archive validation rejects unsafe archive paths', () => {
   assert.equal(validateMigrationArchiveEntries(['cos-app/../evil.txt']).valid, false);
   assert.equal(validateMigrationArchiveEntries(['other/rooms.json']).valid, false);
   assert.equal(validateMigrationArchiveEntries([]).valid, false);
+});
+
+test('migration import temporary upload path is outside persistent cos-app data', () => {
+  assert.equal(MIGRATION_IMPORT_TMP_DIR, '/tmp/migration-imports');
+  assert.equal(MIGRATION_IMPORT_TMP_DIR.includes('/var/data/cos-app'), false);
 });

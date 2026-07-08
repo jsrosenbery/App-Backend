@@ -96,6 +96,7 @@ const MIGRATION_PARENT_DIR = path.basename(DATA_DIR) === MIGRATION_FOLDER_NAME
   : (fs.existsSync('/var/data') ? '/var/data' : path.dirname(DATA_DIR));
 const MIGRATION_DATA_DIR = path.join(MIGRATION_PARENT_DIR, MIGRATION_FOLDER_NAME);
 const MIGRATION_MAX_BACKUP_BYTES = Number(process.env.MIGRATION_MAX_BACKUP_BYTES || 250 * 1024 * 1024);
+const MIGRATION_IMPORT_TMP_DIR = '/tmp/migration-imports';
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -1266,11 +1267,12 @@ const migrationMultipartParser = express.raw({
 // TEMPORARY MIGRATION ONLY.
 app.post('/admin/migration/import-data', requireMigrationToken, migrationMultipartParser, async (req, res) => {
   const timestamp = migrationTimestamp();
-  const uploadPath = path.join(CONVERT_DIR, `cos-app-data-import-${timestamp}.tar.gz`);
+  const uploadPath = path.join(MIGRATION_IMPORT_TMP_DIR, `cos-app-data-import-${timestamp}.tar.gz`);
   let backupPath = '';
   console.log('[TEMP MIGRATION] Import requested:', JSON.stringify({
     targetParent: MIGRATION_PARENT_DIR,
-    targetDir: MIGRATION_DATA_DIR
+    targetDir: MIGRATION_DATA_DIR,
+    tempDir: MIGRATION_IMPORT_TMP_DIR
   }));
   try {
     if (!Buffer.isBuffer(req.body) || !req.body.length) {
@@ -1280,7 +1282,7 @@ app.post('/admin/migration/import-data', requireMigrationToken, migrationMultipa
     if (!multipartFile.buffer.length) {
       return res.status(400).json({ error: 'Backup file is empty' });
     }
-    fs.mkdirSync(CONVERT_DIR, { recursive: true });
+    fs.mkdirSync(MIGRATION_IMPORT_TMP_DIR, { recursive: true });
     fs.writeFileSync(uploadPath, multipartFile.buffer);
 
     const listed = await runCommand('tar', ['-tzf', uploadPath], { timeout: 120000, windowsHide: true });
@@ -1843,5 +1845,6 @@ module.exports = {
   convertDocxToPdf,
   runCommand,
   validateMigrationArchiveEntries,
-  extractMultipartFile
+  extractMultipartFile,
+  MIGRATION_IMPORT_TMP_DIR
 };
