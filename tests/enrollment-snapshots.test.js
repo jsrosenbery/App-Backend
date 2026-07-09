@@ -187,3 +187,26 @@ test('migration import temporary upload path is outside persistent cos-app data'
   assert.equal(MIGRATION_IMPORT_TMP_DIR, '/tmp/migration-imports');
   assert.equal(MIGRATION_IMPORT_TMP_DIR.includes('/var/data/cos-app'), false);
 });
+
+test('room catalog export is public but import remains password protected', async () => {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'rooms.json'), JSON.stringify([
+    { campus: 'COS', building: 'A', room: '101', capacity: 40, type: 'Classroom' }
+  ]));
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const exported = await jsonRequest(baseUrl, '/api/rooms/export');
+    assert.equal(exported.response.status, 200);
+    assert.equal(exported.payload.data.length, 1);
+    assert.equal(exported.payload.data[0].building, 'A');
+
+    const deniedImport = await jsonRequest(baseUrl, '/api/rooms/import', {
+      method: 'POST',
+      body: JSON.stringify({ rooms: [{ building: 'B', room: '201' }] })
+    });
+    assert.equal(deniedImport.response.status, 403);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});

@@ -1710,18 +1710,17 @@ app.get('/api/rooms', (req, res) => {
   }
 });
 
-app.post('/api/rooms/export', (req, res) => {
-  const { password } = req.body || {};
-  if (!isAuthorized(password)) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
+function handleRoomCatalogExport(_req, res) {
   try {
     return res.json(readRoomCatalog());
   } catch (err) {
     console.error('Room catalog export error:', err);
     return res.status(500).json({ error: 'Room catalog export failed' });
   }
-});
+}
+
+app.get('/api/rooms/export', handleRoomCatalogExport);
+app.post('/api/rooms/export', handleRoomCatalogExport);
 
 app.post('/api/rooms/import', (req, res) => {
   const { password, rooms } = req.body || {};
