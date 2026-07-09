@@ -15,32 +15,35 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || CORS_ORIGIN)
   .filter(Boolean);
 const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD || '';
 const GENERAL_PASSWORD = process.env.GENERAL_PASSWORD || UPLOAD_PASSWORD;
+const DIV_CHAIR_PASSWORD = process.env.DIV_CHAIR_PASSWORD || '';
 const DEAN_PASSWORD = process.env.DEAN_PASSWORD || '';
 const EM_PASSWORD = process.env.EM_PASSWORD || UPLOAD_PASSWORD;
 const DEV_PASSWORD = process.env.DEV_PASSWORD || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const MIGRATION_TOKEN = process.env.MIGRATION_TOKEN || '';
 const ENROLLMENT_SESSION_TTL_MS = Number(process.env.ENROLLMENT_SESSION_TTL_MS || 30 * 60 * 1000);
 const enrollmentSessions = new Map();
 const ROLE_LEVEL = {
   general: 1,
-  dean: 2,
+  divchair: 2,
+  dean: 3,
   em: 3,
   development: 4,
   admin: 5
 };
 const ROLE_LABEL = {
   general: 'General',
-  dean: 'Dean / Division Chair',
-  em: 'Enrollment Management',
-  development: 'Development',
-  admin: 'Administrator'
+  divchair: 'Division Chair / Administrative Assistant',
+  dean: 'Dean / Enrollment Management',
+  em: 'Dean / Enrollment Management',
+  development: 'Developer',
+  admin: 'System Administrator'
 };
 const ROLE_PASSWORDS = [
   ['admin', ADMIN_PASSWORD],
   ['development', DEV_PASSWORD],
-  ['em', EM_PASSWORD],
   ['dean', DEAN_PASSWORD],
+  ['dean', EM_PASSWORD],
+  ['divchair', DIV_CHAIR_PASSWORD],
   ['general', GENERAL_PASSWORD]
 ];
 
@@ -90,13 +93,6 @@ const EMAIL_RATE_LIMIT_MAX = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_MAX |
 const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
-const MIGRATION_FOLDER_NAME = 'cos-app';
-const MIGRATION_PARENT_DIR = path.basename(DATA_DIR) === MIGRATION_FOLDER_NAME
-  ? path.dirname(DATA_DIR)
-  : (fs.existsSync('/var/data') ? '/var/data' : path.dirname(DATA_DIR));
-const MIGRATION_DATA_DIR = path.join(MIGRATION_PARENT_DIR, MIGRATION_FOLDER_NAME);
-const MIGRATION_MAX_BACKUP_BYTES = Number(process.env.MIGRATION_MAX_BACKUP_BYTES || 250 * 1024 * 1024);
-const MIGRATION_IMPORT_TMP_DIR = '/tmp/migration-imports';
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -516,149 +512,6 @@ function safeFilename(name, fallback) {
 
 function contentDispositionFilename(filename) {
   return String(filename || 'download.pdf').replace(/["\r\n]/g, '_');
-}
-
-function migrationTokenAuthorized(req) {
-  if (!MIGRATION_TOKEN) return false;
-  const suppliedToken = String(req.get('x-migration-token') || '');
-  if (!suppliedToken) return false;
-  const expected = Buffer.from(MIGRATION_TOKEN);
-  const supplied = Buffer.from(suppliedToken);
-  return expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
-}
-
-function requireMigrationToken(req, res, next) {
-  if (!migrationTokenAuthorized(req)) {
-    console.warn('[TEMP MIGRATION] Unauthorized migration endpoint attempt:', JSON.stringify({
-      method: req.method,
-      path: req.path,
-      remoteAddress: req.ip || req.socket?.remoteAddress || ''
-    }));
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-  return next();
-}
-
-function migrationTimestamp() {
-  return new Date().toISOString().replace(/[:.]/g, '-');
-}
-
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-  if (!Number.isFinite(value) || value <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let size = value;
-  let index = 0;
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index += 1;
-  }
-  return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
-}
-
-function directoryUsage(dirPath) {
-  const summary = { bytes: 0, files: 0, folders: 0 };
-  if (!fs.existsSync(dirPath)) return summary;
-  const stack = [dirPath];
-  while (stack.length) {
-    const current = stack.pop();
-    let entries = [];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch (_err) {
-      continue;
-    }
-    for (const entry of entries) {
-      const entryPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        summary.folders += 1;
-        stack.push(entryPath);
-      } else if (entry.isFile()) {
-        summary.files += 1;
-        try {
-          summary.bytes += fs.statSync(entryPath).size;
-        } catch (_err) {
-          // Ignore files that change while status is being calculated.
-        }
-      }
-    }
-  }
-  return summary;
-}
-
-function topLevelDataEntries(dirPath) {
-  if (!fs.existsSync(dirPath)) return [];
-  return fs.readdirSync(dirPath, { withFileTypes: true })
-    .map(entry => ({
-      name: entry.name,
-      type: entry.isDirectory() ? 'directory' : (entry.isFile() ? 'file' : 'other')
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function validateMigrationArchiveEntries(entries) {
-  const cleanEntries = (Array.isArray(entries) ? entries : [])
-    .map(entry => String(entry || '').trim())
-    .filter(Boolean);
-  if (!cleanEntries.length) {
-    return { valid: false, error: 'Archive is empty or unreadable', entries: cleanEntries };
-  }
-  const hasCosAppPath = cleanEntries.some(entry => entry === `${MIGRATION_FOLDER_NAME}/` || entry.startsWith(`${MIGRATION_FOLDER_NAME}/`));
-  if (!hasCosAppPath) {
-    return { valid: false, error: `Archive must contain ${MIGRATION_FOLDER_NAME}/ paths`, entries: cleanEntries };
-  }
-  for (const entry of cleanEntries) {
-    const normalized = entry.replace(/\\/g, '/');
-    if (normalized.startsWith('/') || /^[a-zA-Z]:\//.test(normalized)) {
-      return { valid: false, error: `Archive contains an absolute path: ${entry}`, entries: cleanEntries };
-    }
-    if (normalized.split('/').includes('..')) {
-      return { valid: false, error: `Archive contains path traversal: ${entry}`, entries: cleanEntries };
-    }
-    if (!(normalized === `${MIGRATION_FOLDER_NAME}/` || normalized.startsWith(`${MIGRATION_FOLDER_NAME}/`))) {
-      return { valid: false, error: `Archive contains a path outside ${MIGRATION_FOLDER_NAME}/: ${entry}`, entries: cleanEntries };
-    }
-  }
-  return { valid: true, error: '', entries: cleanEntries };
-}
-
-function extractMultipartFile(buffer, contentType, fieldName) {
-  const boundaryMatch = String(contentType || '').match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-  const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2] || '').trim() : '';
-  if (!boundary) throw Object.assign(new Error('Multipart boundary is missing'), { status: 400 });
-
-  const delimiter = Buffer.from(`--${boundary}`);
-  const headerSeparator = Buffer.from('\r\n\r\n');
-  let offset = 0;
-  while (offset < buffer.length) {
-    const partStart = buffer.indexOf(delimiter, offset);
-    if (partStart < 0) break;
-    const nextStart = buffer.indexOf(delimiter, partStart + delimiter.length);
-    if (nextStart < 0) break;
-    let contentStart = partStart + delimiter.length;
-    if (buffer.slice(contentStart, contentStart + 2).toString() === '--') break;
-    if (buffer.slice(contentStart, contentStart + 2).toString() === '\r\n') contentStart += 2;
-    const headerEnd = buffer.indexOf(headerSeparator, contentStart);
-    if (headerEnd < 0 || headerEnd > nextStart) {
-      offset = nextStart;
-      continue;
-    }
-    const headers = buffer.slice(contentStart, headerEnd).toString('utf8');
-    const disposition = headers.match(/content-disposition:[^\r\n]+/i)?.[0] || '';
-    const name = disposition.match(/name="([^"]+)"/i)?.[1] || '';
-    const filename = disposition.match(/filename="([^"]*)"/i)?.[1] || '';
-    if (name === fieldName) {
-      let bodyStart = headerEnd + headerSeparator.length;
-      let bodyEnd = nextStart;
-      if (buffer.slice(bodyEnd - 2, bodyEnd).toString() === '\r\n') bodyEnd -= 2;
-      return {
-        filename,
-        buffer: buffer.slice(bodyStart, bodyEnd)
-      };
-    }
-    offset = nextStart;
-  }
-  throw Object.assign(new Error(`Multipart file field "${fieldName}" is required`), { status: 400 });
 }
 
 function runCommand(command, args, options = {}) {
@@ -1194,131 +1047,6 @@ app.get('/api/admin/diagnostics', (_req, res) => {
   return res.json(diagnosticsPayload());
 });
 
-// TEMPORARY MIGRATION ONLY.
-// Remove these endpoints after the Render native-Node-to-Docker data migration is complete.
-app.get('/admin/migration/status', requireMigrationToken, (_req, res) => {
-  console.log('[TEMP MIGRATION] Status requested:', JSON.stringify({
-    dataDir: MIGRATION_DATA_DIR,
-    parentDir: MIGRATION_PARENT_DIR
-  }));
-  const usage = directoryUsage(MIGRATION_DATA_DIR);
-  return res.json({
-    temporaryMigrationOnly: true,
-    dataDir: MIGRATION_DATA_DIR,
-    parentDir: MIGRATION_PARENT_DIR,
-    exists: fs.existsSync(MIGRATION_DATA_DIR),
-    diskUsage: {
-      bytes: usage.bytes,
-      human: formatBytes(usage.bytes),
-      files: usage.files,
-      folders: usage.folders
-    },
-    topLevelEntries: topLevelDataEntries(MIGRATION_DATA_DIR),
-    timestamp: new Date().toISOString()
-  });
-});
-
-// TEMPORARY MIGRATION ONLY.
-app.get('/admin/migration/export-data', requireMigrationToken, async (_req, res) => {
-  const timestamp = migrationTimestamp();
-  const archivePath = path.join(CONVERT_DIR, `cos-app-data-backup-${timestamp}.tar.gz`);
-  console.log('[TEMP MIGRATION] Export requested:', JSON.stringify({
-    source: MIGRATION_DATA_DIR,
-    archivePath
-  }));
-  if (!fs.existsSync(MIGRATION_DATA_DIR)) {
-    return res.status(404).json({ error: `${MIGRATION_DATA_DIR} does not exist` });
-  }
-  try {
-    await runCommand('tar', [
-      '--exclude',
-      `${MIGRATION_FOLDER_NAME}/conversions`,
-      '-czf',
-      archivePath,
-      '-C',
-      MIGRATION_PARENT_DIR,
-      MIGRATION_FOLDER_NAME
-    ], { timeout: 120000, windowsHide: true });
-    res.setHeader('Content-Type', 'application/gzip');
-    res.setHeader('Content-Disposition', 'attachment; filename="cos-app-data-backup.tar.gz"');
-    res.on('finish', () => {
-      fs.rm(archivePath, { force: true }, () => {});
-    });
-    res.on('close', () => {
-      fs.rm(archivePath, { force: true }, () => {});
-    });
-    return fs.createReadStream(archivePath).pipe(res);
-  } catch (err) {
-    fs.rm(archivePath, { force: true }, () => {});
-    console.error('[TEMP MIGRATION] Export failed:', JSON.stringify({
-      message: err.message || '',
-      stderr: err.stderr || '',
-      exitCode: err.exitCode ?? null
-    }));
-    return res.status(500).json({ error: 'Migration export failed', reason: err.message || '' });
-  }
-});
-
-const migrationMultipartParser = express.raw({
-  type: req => /^multipart\/form-data\b/i.test(String(req.headers['content-type'] || '')),
-  limit: MIGRATION_MAX_BACKUP_BYTES
-});
-
-// TEMPORARY MIGRATION ONLY.
-app.post('/admin/migration/import-data', requireMigrationToken, migrationMultipartParser, async (req, res) => {
-  const timestamp = migrationTimestamp();
-  const uploadPath = path.join(MIGRATION_IMPORT_TMP_DIR, `cos-app-data-import-${timestamp}.tar.gz`);
-  let backupPath = '';
-  console.log('[TEMP MIGRATION] Import requested:', JSON.stringify({
-    targetParent: MIGRATION_PARENT_DIR,
-    targetDir: MIGRATION_DATA_DIR,
-    tempDir: MIGRATION_IMPORT_TMP_DIR
-  }));
-  try {
-    if (!Buffer.isBuffer(req.body) || !req.body.length) {
-      return res.status(400).json({ error: 'Multipart backup file is required' });
-    }
-    const multipartFile = extractMultipartFile(req.body, req.headers['content-type'], 'backup');
-    if (!multipartFile.buffer.length) {
-      return res.status(400).json({ error: 'Backup file is empty' });
-    }
-    fs.mkdirSync(MIGRATION_IMPORT_TMP_DIR, { recursive: true });
-    fs.writeFileSync(uploadPath, multipartFile.buffer);
-
-    const listed = await runCommand('tar', ['-tzf', uploadPath], { timeout: 120000, windowsHide: true });
-    const entries = String(listed.stdout || '').split(/\r?\n/);
-    const validation = validateMigrationArchiveEntries(entries);
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.error });
-    }
-
-    fs.mkdirSync(MIGRATION_PARENT_DIR, { recursive: true });
-    if (fs.existsSync(MIGRATION_DATA_DIR)) {
-      backupPath = path.join(MIGRATION_PARENT_DIR, `${MIGRATION_FOLDER_NAME}-before-import-${timestamp}`);
-      fs.renameSync(MIGRATION_DATA_DIR, backupPath);
-    }
-    await runCommand('tar', ['-xzf', uploadPath, '-C', MIGRATION_PARENT_DIR], { timeout: 120000, windowsHide: true });
-    const usage = directoryUsage(MIGRATION_DATA_DIR);
-    return res.json({
-      imported: true,
-      filesRestored: usage.files,
-      foldersRestored: usage.folders,
-      backupPath,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    console.error('[TEMP MIGRATION] Import failed:', JSON.stringify({
-      message: err.message || '',
-      status: err.status || 500,
-      stderr: err.stderr || '',
-      exitCode: err.exitCode ?? null
-    }));
-    return res.status(err.status || 500).json({ error: err.message || 'Migration import failed' });
-  } finally {
-    fs.rm(uploadPath, { force: true }, () => {});
-  }
-});
-
 app.post('/api/auth/enrollment-management', (req, res) => {
   const { password } = req.body || {};
   const role = authenticateRolePassword(password, 'em');
@@ -1842,8 +1570,5 @@ module.exports = {
   contentDispositionFilename,
   cleanupConversionDir,
   convertDocxToPdf,
-  runCommand,
-  validateMigrationArchiveEntries,
-  extractMultipartFile,
-  MIGRATION_IMPORT_TMP_DIR
+  runCommand
 };

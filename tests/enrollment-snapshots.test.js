@@ -10,13 +10,13 @@ fs.mkdirSync(dataDir, { recursive: true });
 process.env.DATA_DIR = dataDir;
 process.env.UPLOAD_PASSWORD = 'Upload2025';
 process.env.GENERAL_PASSWORD = 'GeneralSecret';
+process.env.DIV_CHAIR_PASSWORD = 'DivChairSecret';
 process.env.DEAN_PASSWORD = 'DeanSecret';
 process.env.EM_PASSWORD = 'EmSecret';
 process.env.DEV_PASSWORD = 'DevSecret';
 process.env.ADMIN_PASSWORD = 'AdminSecret';
-process.env.MIGRATION_TOKEN = 'MigrationSecret';
 
-const { app, validateMigrationArchiveEntries, MIGRATION_IMPORT_TMP_DIR } = require('../server');
+const { app } = require('../server');
 
 function listen() {
   return new Promise(resolve => {
@@ -114,11 +114,14 @@ test('role authentication honors hierarchical password access', async () => {
     const baseUrl = `http://127.0.0.1:${server.address().port}`;
     const cases = [
       ['GeneralSecret', 'general', 'general'],
+      ['DivChairSecret', 'general', 'divchair'],
+      ['DivChairSecret', 'divchair', 'divchair'],
+      ['DeanSecret', 'divchair', 'dean'],
       ['DeanSecret', 'general', 'dean'],
       ['DeanSecret', 'dean', 'dean'],
-      ['EmSecret', 'dean', 'em'],
-      ['EmSecret', 'em', 'em'],
-      ['DevSecret', 'em', 'development'],
+      ['EmSecret', 'dean', 'dean'],
+      ['EmSecret', 'em', 'dean'],
+      ['DevSecret', 'dean', 'development'],
       ['DevSecret', 'development', 'development'],
       ['AdminSecret', 'development', 'admin'],
       ['AdminSecret', 'admin', 'admin']
@@ -135,58 +138,25 @@ test('role authentication honors hierarchical password access', async () => {
       assert.ok(auth.payload.roleLevel >= 1);
     }
 
-    const deanDeniedForEm = await jsonRequest(baseUrl, '/api/auth/role', {
+    const divChairDeniedForDean = await jsonRequest(baseUrl, '/api/auth/role', {
       method: 'POST',
-      body: JSON.stringify({ password: 'DeanSecret', requestedRole: 'em' })
+      body: JSON.stringify({ password: 'DivChairSecret', requestedRole: 'dean' })
     });
-    assert.equal(deanDeniedForEm.response.status, 403);
+    assert.equal(divChairDeniedForDean.response.status, 403);
 
     const emCompatibility = await jsonRequest(baseUrl, '/api/auth/enrollment-management', {
       method: 'POST',
       body: JSON.stringify({ password: 'EmSecret' })
     });
     assert.equal(emCompatibility.response.status, 200);
-    assert.equal(emCompatibility.payload.role, 'em');
+    assert.equal(emCompatibility.payload.role, 'dean');
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
 });
 
-test('temporary migration endpoints require token and report data status', async () => {
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(path.join(dataDir, 'rooms.json'), JSON.stringify([{ building: 'A', room: '1' }]));
-  const server = await listen();
-  try {
-    const baseUrl = `http://127.0.0.1:${server.address().port}`;
-    const denied = await fetch(`${baseUrl}/admin/migration/status`);
-    assert.equal(denied.status, 403);
 
-    const allowed = await fetch(`${baseUrl}/admin/migration/status`, {
-      headers: { 'x-migration-token': 'MigrationSecret' }
-    });
-    assert.equal(allowed.status, 200);
-    const payload = await allowed.json();
-    assert.equal(payload.temporaryMigrationOnly, true);
-    assert.equal(payload.exists, true);
-    assert.ok(payload.diskUsage.files >= 1);
-    assert.ok(payload.topLevelEntries.some(entry => entry.name === 'rooms.json'));
-  } finally {
-    await new Promise(resolve => server.close(resolve));
-  }
-});
 
-test('migration archive validation rejects unsafe archive paths', () => {
-  assert.equal(validateMigrationArchiveEntries(['cos-app/', 'cos-app/rooms.json']).valid, true);
-  assert.equal(validateMigrationArchiveEntries(['/cos-app/rooms.json']).valid, false);
-  assert.equal(validateMigrationArchiveEntries(['cos-app/../evil.txt']).valid, false);
-  assert.equal(validateMigrationArchiveEntries(['other/rooms.json']).valid, false);
-  assert.equal(validateMigrationArchiveEntries([]).valid, false);
-});
-
-test('migration import temporary upload path is outside persistent cos-app data', () => {
-  assert.equal(MIGRATION_IMPORT_TMP_DIR, '/tmp/migration-imports');
-  assert.equal(MIGRATION_IMPORT_TMP_DIR.includes('/var/data/cos-app'), false);
-});
 
 test('room catalog export is public but import remains password protected', async () => {
   fs.mkdirSync(dataDir, { recursive: true });
