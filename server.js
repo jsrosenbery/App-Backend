@@ -93,6 +93,7 @@ const EMAIL_RATE_LIMIT_MAX = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_MAX |
 const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
+const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -101,6 +102,9 @@ if (!fs.existsSync(ANALYTICS_ARCHIVE_DIR)) {
 }
 if (!fs.existsSync(FACULTY_SCHEDULES_DIR)) {
   fs.mkdirSync(FACULTY_SCHEDULES_DIR, { recursive: true });
+}
+if (!fs.existsSync(WORK_EXPERIENCE_DIR)) {
+  fs.mkdirSync(WORK_EXPERIENCE_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -138,6 +142,13 @@ function getFacultySchedulePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(FACULTY_SCHEDULES_DIR, `${term}.json`);
   const dataRoot = path.resolve(FACULTY_SCHEDULES_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function getWorkExperiencePath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(WORK_EXPERIENCE_DIR, `${term}.json`);
+  const dataRoot = path.resolve(WORK_EXPERIENCE_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
@@ -1257,6 +1268,62 @@ function readFacultyScheduleArchive(term) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
+function dataField(row, names) {
+  if (!row || typeof row !== 'object') return '';
+  const normalizeKey = value => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const aliases = new Set(names.map(normalizeKey));
+  for (const [key, value] of Object.entries(row)) {
+    if (aliases.has(normalizeKey(key)) && value != null && String(value).trim()) return String(value).trim();
+  }
+  return '';
+}
+
+function numericField(row, names) {
+  const raw = dataField(row, names);
+  const value = Number(String(raw).replace(/,/g, ''));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function workExperienceMetadata(term, rows, base = {}) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const crns = new Set();
+  let enrollmentTotal = 0;
+  let ftesTotal = 0;
+  safeRows.forEach(row => {
+    const crn = dataField(row, ['CRN', 'crn']);
+    if (crn) crns.add(crn.toUpperCase());
+    enrollmentTotal += numericField(row, ['ACTUAL_ENROLL', 'Actual Enroll', 'Current Enrollment', 'Enrollment', 'CENSUS_ENROLL']);
+    ftesTotal += numericField(row, ['FTES', 'ftes']);
+  });
+  return {
+    term,
+    uploadedAt: base.uploadedAt || new Date().toISOString(),
+    uploadedByRole: base.uploadedByRole || '',
+    sourceFileName: base.sourceFileName || '',
+    rawRowCount: safeRows.length,
+    distinctCrnCount: crns.size,
+    enrollmentTotal,
+    ftesTotal
+  };
+}
+
+function validateWorkExperienceRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return { valid: false, error: 'Work Experience rows are required.' };
+  }
+  const hasCrn = rows.some(row => dataField(row, ['CRN', 'crn']));
+  if (!hasCrn) {
+    return { valid: false, error: 'This does not appear to be a Work Experience file. Work Experience rows must include CRN values.' };
+  }
+  return { valid: true };
+}
+
+function readWorkExperienceArchive(term) {
+  const filePath = getWorkExperiencePath(term);
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
 app.get('/api/faculty-schedules', (req, res) => {
   try {
     const data = fs.readdirSync(FACULTY_SCHEDULES_DIR)
@@ -1326,6 +1393,78 @@ app.delete('/api/faculty-schedules/:term', (req, res) => {
   } catch (err) {
     console.error('Faculty schedule archive delete error:', err);
     return res.status(500).json({ error: 'Faculty schedule archive delete failed' });
+  }
+});
+
+app.get('/api/work-experience', (req, res) => {
+  try {
+    const data = fs.readdirSync(WORK_EXPERIENCE_DIR)
+      .filter(file => file.toLowerCase().endsWith('.json'))
+      .map(file => {
+        const term = path.basename(file, '.json');
+        const payload = readWorkExperienceArchive(term);
+        const stats = fs.statSync(path.join(WORK_EXPERIENCE_DIR, file));
+        return payload?.metadata || { term, uploadedAt: stats.mtime.toISOString() };
+      })
+      .sort((a, b) => String(a.term || '').localeCompare(String(b.term || ''), undefined, { numeric: true }));
+    return res.json({ data });
+  } catch (err) {
+    console.error('Work Experience archive list error:', err);
+    return res.status(500).json({ error: 'Work Experience archive list failed' });
+  }
+});
+
+app.get('/api/work-experience/:term', (req, res) => {
+  const term = req.params.term;
+  const filePath = getWorkExperiencePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  if (!fs.existsSync(filePath)) return res.json({ term, metadata: null, data: [] });
+  try {
+    const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return res.json({ term, metadata: payload.metadata || null, data: Array.isArray(payload.rows) ? payload.rows : [] });
+  } catch (err) {
+    console.error('Work Experience archive read error:', err);
+    return res.status(500).json({ error: 'Work Experience archive read failed' });
+  }
+});
+
+app.post('/api/work-experience/:term', (req, res) => {
+  const term = req.params.term;
+  const { rows, password, sourceFileName = '' } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getWorkExperiencePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  const validation = validateWorkExperienceRows(rows);
+  if (!validation.valid) return res.status(400).json({ error: validation.error });
+  try {
+    const metadata = workExperienceMetadata(term, rows, {
+      uploadedByRole: enrollmentSessionRole(req) || (isAuthorized(password) ? 'general' : ''),
+      sourceFileName
+    });
+    fs.writeFileSync(filePath, JSON.stringify({ metadata, rows }, null, 2));
+    return res.json({ success: true, term, metadata, data: rows });
+  } catch (err) {
+    console.error('Work Experience archive write error:', err);
+    return res.status(500).json({ error: 'Work Experience archive write failed' });
+  }
+});
+
+app.delete('/api/work-experience/:term', (req, res) => {
+  const term = req.params.term;
+  const { password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getWorkExperiencePath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return res.json({ success: true, term });
+  } catch (err) {
+    console.error('Work Experience archive delete error:', err);
+    return res.status(500).json({ error: 'Work Experience archive delete failed' });
   }
 });
 
@@ -1570,5 +1709,7 @@ module.exports = {
   contentDispositionFilename,
   cleanupConversionDir,
   convertDocxToPdf,
-  runCommand
+  runCommand,
+  validateWorkExperienceRows,
+  workExperienceMetadata
 };
