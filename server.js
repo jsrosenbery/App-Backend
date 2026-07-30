@@ -458,11 +458,14 @@ function readCurriculumCrosswalk() {
 }
 
 function snapshotKey(record) {
-  return [
+  const snapshotType = String(record.snapshotType || record['Snapshot Type'] || '').trim().toUpperCase();
+  const parts = [
     String(record.term || record.Term || '').trim().toUpperCase(),
     String(record.crn || record.CRN || '').trim().toUpperCase(),
-    String(record.snapshotType || record['Snapshot Type'] || '').trim().toUpperCase()
-  ].join('|');
+    snapshotType
+  ];
+  if (snapshotType === 'CUSTOM') parts.push(String(record.snapshotDate || record['Snapshot Date'] || '').trim());
+  return parts.join('|');
 }
 
 function normalizeEnrollmentSnapshotRecords(records) {
