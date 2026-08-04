@@ -94,6 +94,7 @@ const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
+const LOW_ENROLLMENT_TRACKING_DIR = path.join(DATA_DIR, 'low-enrollment-tracking');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -105,6 +106,9 @@ if (!fs.existsSync(FACULTY_SCHEDULES_DIR)) {
 }
 if (!fs.existsSync(WORK_EXPERIENCE_DIR)) {
   fs.mkdirSync(WORK_EXPERIENCE_DIR, { recursive: true });
+}
+if (!fs.existsSync(LOW_ENROLLMENT_TRACKING_DIR)) {
+  fs.mkdirSync(LOW_ENROLLMENT_TRACKING_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -149,6 +153,17 @@ function getWorkExperiencePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(WORK_EXPERIENCE_DIR, `${term}.json`);
   const dataRoot = path.resolve(WORK_EXPERIENCE_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function isValidLowEnrollmentTermCode(term) {
+  return /^\d{6}$/.test(String(term || '').trim());
+}
+
+function getLowEnrollmentTrackingPath(term) {
+  if (!isValidLowEnrollmentTermCode(term)) return null;
+  const filePath = path.resolve(LOW_ENROLLMENT_TRACKING_DIR, `${term}.json`);
+  const dataRoot = path.resolve(LOW_ENROLLMENT_TRACKING_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
@@ -226,6 +241,20 @@ function enrollmentSessionRole(req) {
     return '';
   }
   return typeof session === 'number' ? 'em' : session?.role || 'em';
+}
+
+function requireEnrollmentRole(req, res, minimumRole = 'development') {
+  if (!isEnrollmentSessionAuthorized(req)) {
+    res.status(401).json({ error: 'Enrollment Management session is required.', code: 'UNAUTHORIZED' });
+    return null;
+  }
+  const role = enrollmentSessionRole(req);
+  const requiredLevel = ROLE_LEVEL[minimumRole] || ROLE_LEVEL.development;
+  if (!role || (ROLE_LEVEL[role] || 0) < requiredLevel) {
+    res.status(403).json({ error: 'Insufficient role for this action.', code: 'FORBIDDEN' });
+    return null;
+  }
+  return role;
 }
 
 function normalizeRoomCatalog(rooms) {
@@ -1468,6 +1497,422 @@ app.delete('/api/work-experience/:term', (req, res) => {
   } catch (err) {
     console.error('Work Experience archive delete error:', err);
     return res.status(500).json({ error: 'Work Experience archive delete failed' });
+  }
+});
+
+const LOW_ENROLLMENT_EDITABLE_FIELDS = new Set(['justification', 'vpComments']);
+const lowEnrollmentTermLocks = new Map();
+
+function lowEnrollmentError(message, code = 'LOW_ENROLLMENT_ERROR', statusCode = 400, extra = {}) {
+  const err = new Error(message);
+  err.code = code;
+  err.statusCode = statusCode;
+  Object.assign(err, extra);
+  return err;
+}
+
+function sendLowEnrollmentError(res, err, fallback = 'Low Enrollment Tracking request failed') {
+  const status = err?.statusCode || 500;
+  const code = err?.code || (status >= 500 ? 'STORAGE_FAILURE' : 'LOW_ENROLLMENT_ERROR');
+  const payload = {
+    error: err?.message || fallback,
+    code
+  };
+  if (err?.requiresConfirmation) payload.requiresConfirmation = true;
+  if (err?.summary) payload.summary = err.summary;
+  if (err?.snapshotDate) payload.snapshotDate = err.snapshotDate;
+  if (err?.warnings) payload.warnings = err.warnings;
+  return res.status(status).json(payload);
+}
+
+function lowEnrollmentAllowedReasons(workspace) {
+  return Array.from(new Set((Array.isArray(workspace?.reasons) ? workspace.reasons : [])
+    .map(value => String(value || '').trim())
+    .filter(Boolean)));
+}
+
+function normalizeLowEnrollmentDate(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? text : parsed.toISOString().slice(0, 10);
+}
+
+function normalizeLowEnrollmentNumber(value, preserveNull = true) {
+  if (value === null || value === undefined || String(value).trim?.() === '') return preserveNull ? null : 0;
+  const number = Number(String(value).replace(/[$,%]/g, '').trim());
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeLowEnrollmentCrns(crns) {
+  return Array.from(new Set((Array.isArray(crns) ? crns : [])
+    .map(value => String(value || '').trim())
+    .filter(Boolean)));
+}
+
+function lowEnrollmentStatusForRow(row) {
+  const threshold = normalizeLowEnrollmentNumber(row?.threshold);
+  const latest = normalizeLowEnrollmentNumber(row?.latestEnrollment);
+  const current = normalizeLowEnrollmentNumber(row?.currentEnrollment);
+  const initial = normalizeLowEnrollmentNumber(row?.initialEnrollment);
+  const basis = latest !== null ? latest : current !== null ? current : initial;
+  if (basis === null || threshold === null) return 'Manual Review';
+  return basis >= threshold ? 'Threshold Met' : 'Below Threshold';
+}
+
+function lowEnrollmentValidationWarnings(rows = []) {
+  const crnRows = new Map();
+  rows.forEach(row => {
+    (row.crns || []).forEach(crn => {
+      const key = String(crn);
+      if (!crnRows.has(key)) crnRows.set(key, []);
+      crnRows.get(key).push(String(row.id));
+    });
+  });
+  return Array.from(crnRows.entries())
+    .filter(([, rowIds]) => rowIds.length > 1)
+    .map(([crn, rowIds]) => ({ code: 'DUPLICATE_CRN', crn, rowIds }));
+}
+
+function validateLowEnrollmentWorkspace(workspace, expectedTermCode = '') {
+  if (!workspace || typeof workspace !== 'object') {
+    throw lowEnrollmentError('Workspace payload is required.', 'INVALID_WORKSPACE', 400);
+  }
+  const termCode = String(workspace.termCode || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) {
+    throw lowEnrollmentError('A valid six-digit term code is required.', 'INVALID_TERM', 400);
+  }
+  if (expectedTermCode && termCode !== expectedTermCode) {
+    throw lowEnrollmentError('Workspace term code must match the request term.', 'INVALID_WORKSPACE', 400);
+  }
+  if (!Array.isArray(workspace.reasons) || !lowEnrollmentAllowedReasons(workspace).length) {
+    throw lowEnrollmentError('At least one saved Justification reason is required.', 'INVALID_WORKSPACE', 400);
+  }
+  if (!Array.isArray(workspace.rows) || !workspace.rows.length) {
+    throw lowEnrollmentError('Tracker rows are required.', 'INVALID_WORKSPACE', 400);
+  }
+  if (!Array.isArray(workspace.snapshots)) {
+    throw lowEnrollmentError('Snapshots must be an array.', 'INVALID_WORKSPACE', 400);
+  }
+  if (!Array.isArray(workspace.uploadHistory)) {
+    throw lowEnrollmentError('Upload history must be an array.', 'INVALID_WORKSPACE', 400);
+  }
+  const ids = new Set();
+  workspace.rows.forEach((row, index) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      throw lowEnrollmentError(`Tracker row ${index + 1} must be an object.`, 'INVALID_WORKSPACE', 400);
+    }
+    const rowId = String(row.id || '').trim();
+    if (!rowId) throw lowEnrollmentError(`Tracker row ${index + 1} is missing a stable id.`, 'INVALID_WORKSPACE', 400);
+    if (ids.has(rowId)) throw lowEnrollmentError(`Duplicate tracker row id: ${rowId}.`, 'INVALID_WORKSPACE', 400);
+    ids.add(rowId);
+    const crns = normalizeLowEnrollmentCrns(row.crns);
+    if (!crns.length) throw lowEnrollmentError(`Tracker row ${rowId} is missing CRNs.`, 'INVALID_WORKSPACE', 400);
+    if (crns.some(crn => !/^\d+$/.test(crn))) throw lowEnrollmentError(`Tracker row ${rowId} contains an invalid CRN.`, 'INVALID_WORKSPACE', 400);
+    const threshold = normalizeLowEnrollmentNumber(row.threshold);
+    if (threshold === null || threshold < 0) throw lowEnrollmentError(`Tracker row ${rowId} has an invalid threshold.`, 'INVALID_WORKSPACE', 400);
+  });
+  return lowEnrollmentValidationWarnings(workspace.rows);
+}
+
+function normalizeLowEnrollmentWorkspace(workspace, base = {}) {
+  const now = new Date().toISOString();
+  const prior = base.prior || {};
+  if (!Array.isArray(workspace?.snapshots)) {
+    throw lowEnrollmentError('Snapshots must be an array.', 'INVALID_WORKSPACE', 400);
+  }
+  if (!Array.isArray(workspace?.uploadHistory)) {
+    throw lowEnrollmentError('Upload history must be an array.', 'INVALID_WORKSPACE', 400);
+  }
+  const normalized = {
+    ...workspace,
+    termCode: String(workspace.termCode || '').trim(),
+    displayTerm: String(workspace.displayTerm || workspace.termName || workspace.termCode || '').trim(),
+    status: workspace.status || 'active',
+    sourceFilename: String(workspace.sourceFilename || '').trim(),
+    initialSnapshotDate: normalizeLowEnrollmentDate(workspace.initialSnapshotDate),
+    reasons: lowEnrollmentAllowedReasons(workspace),
+    rows: (Array.isArray(workspace.rows) ? workspace.rows : []).map(row => ({
+      ...row,
+      id: String(row.id || '').trim(),
+      crns: normalizeLowEnrollmentCrns(row.crns),
+      threshold: normalizeLowEnrollmentNumber(row.threshold),
+      initialEnrollment: normalizeLowEnrollmentNumber(row.initialEnrollment),
+      currentEnrollment: normalizeLowEnrollmentNumber(row.currentEnrollment),
+      latestEnrollment: normalizeLowEnrollmentNumber(row.latestEnrollment),
+      highestEnrollment: normalizeLowEnrollmentNumber(row.highestEnrollment),
+      justification: String(row.justification || '').trim(),
+      vpComments: String(row.vpComments || '')
+    })),
+    snapshots: Array.isArray(workspace.snapshots) ? workspace.snapshots.map(snapshot => ({
+      ...snapshot,
+      snapshotDate: normalizeLowEnrollmentDate(snapshot.snapshotDate)
+    })) : [],
+    uploadHistory: Array.isArray(workspace.uploadHistory) ? workspace.uploadHistory.map(item => ({
+      ...item,
+      snapshotDate: normalizeLowEnrollmentDate(item.snapshotDate)
+    })) : [],
+    createdAt: prior.createdAt || workspace.createdAt || now,
+    updatedAt: now,
+    importedAt: workspace.importedAt || now
+  };
+  normalized.validationWarnings = validateLowEnrollmentWorkspace(normalized, normalized.termCode);
+  normalized.rows = normalized.rows.map(row => ({ ...row, status: row.status || lowEnrollmentStatusForRow(row) }));
+  return normalized;
+}
+
+function summarizeLowEnrollmentWorkspace(term, workspace, stats = null) {
+  const rows = Array.isArray(workspace?.rows) ? workspace.rows : [];
+  const snapshots = Array.isArray(workspace?.snapshots) ? workspace.snapshots : [];
+  const history = Array.isArray(workspace?.uploadHistory) ? workspace.uploadHistory : [];
+  const crns = new Set();
+  rows.forEach(row => (Array.isArray(row.crns) ? row.crns : []).forEach(crn => crn && crns.add(String(crn))));
+  return {
+    termCode: workspace?.termCode || term,
+    displayTerm: workspace?.displayTerm || workspace?.termName || term,
+    sourceFilename: workspace?.sourceFilename || '',
+    initialSnapshotDate: workspace?.initialSnapshotDate || '',
+    createdAt: workspace?.createdAt || stats?.birthtime?.toISOString?.() || '',
+    updatedAt: workspace?.updatedAt || stats?.mtime?.toISOString?.() || '',
+    rowCount: rows.length,
+    crnCount: crns.size,
+    snapshotCount: snapshots.length,
+    uploadHistoryCount: history.length,
+    validationWarnings: workspace?.validationWarnings || []
+  };
+}
+
+function readLowEnrollmentWorkspace(termCode) {
+  const filePath = getLowEnrollmentTrackingPath(termCode);
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function writeLowEnrollmentWorkspaceAtomic(workspace) {
+  validateLowEnrollmentWorkspace(workspace, workspace.termCode);
+  const filePath = getLowEnrollmentTrackingPath(workspace.termCode);
+  if (!filePath) throw lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400);
+  fs.mkdirSync(LOW_ENROLLMENT_TRACKING_DIR, { recursive: true });
+  const tempPath = path.join(LOW_ENROLLMENT_TRACKING_DIR, `.${workspace.termCode}.${process.pid}.${Date.now()}.tmp`);
+  const json = JSON.stringify(workspace, null, 2);
+  let fd = null;
+  try {
+    fd = fs.openSync(tempPath, 'w');
+    fs.writeFileSync(fd, json, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, filePath);
+    return workspace;
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_closeErr) {}
+    }
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (_unlinkErr) {}
+    throw lowEnrollmentError('Low Enrollment Tracking storage write failed.', 'STORAGE_FAILURE', 500);
+  }
+}
+
+async function withLowEnrollmentTermLock(termCode, operation) {
+  const prior = lowEnrollmentTermLocks.get(termCode) || Promise.resolve();
+  let release = () => {};
+  const gate = new Promise(resolve => { release = resolve; });
+  const queued = prior.catch(() => undefined).then(() => gate);
+  lowEnrollmentTermLocks.set(termCode, queued);
+  await prior.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (lowEnrollmentTermLocks.get(termCode) === queued) lowEnrollmentTermLocks.delete(termCode);
+  }
+}
+
+function validateLowEnrollmentSnapshotRequest(workspace, snapshot, rows, replaceExisting = false) {
+  if (!workspace) throw lowEnrollmentError('Low Enrollment Tracking workspace not found.', 'WORKSPACE_NOT_FOUND', 404);
+  const snapshotDate = normalizeLowEnrollmentDate(snapshot?.snapshotDate);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) {
+    throw lowEnrollmentError('Snapshot date must be ISO YYYY-MM-DD.', 'INVALID_SNAPSHOT', 400);
+  }
+  if (!Array.isArray(rows) || !rows.length) {
+    throw lowEnrollmentError('Snapshot rows are required.', 'INVALID_SNAPSHOT', 400);
+  }
+  const savedIds = (workspace.rows || []).map(row => String(row.id));
+  const savedIdSet = new Set(savedIds);
+  const incomingIds = rows.map(row => String(row?.id || '').trim());
+  if (incomingIds.length !== savedIds.length || incomingIds.some(id => !savedIdSet.has(id)) || new Set(incomingIds).size !== savedIdSet.size) {
+    throw lowEnrollmentError('Snapshot rows must exactly match the saved tracker rows.', 'INVALID_SNAPSHOT', 400);
+  }
+  const invalidSnapshotRowIds = Object.keys(snapshot?.values || {}).filter(rowId => !savedIdSet.has(String(rowId)));
+  if (invalidSnapshotRowIds.length) {
+    throw lowEnrollmentError('Snapshot values reference unknown tracker rows.', 'INVALID_SNAPSHOT', 400);
+  }
+  const existingSnapshot = (workspace.snapshots || []).find(item => String(item.snapshotDate) === snapshotDate);
+  if (existingSnapshot && !replaceExisting) {
+    throw lowEnrollmentError('A snapshot already exists for this date.', 'SNAPSHOT_EXISTS', 409, { requiresConfirmation: true, snapshotDate });
+  }
+  return snapshotDate;
+}
+
+function mergeLowEnrollmentSnapshotRows(savedRows = [], incomingRows = []) {
+  const incomingById = new Map(incomingRows.map(row => [String(row.id), row]));
+  return savedRows.map(savedRow => {
+    const incoming = incomingById.get(String(savedRow.id)) || {};
+    const merged = {
+      ...savedRow,
+      ...incoming,
+      id: savedRow.id,
+      crns: savedRow.crns,
+      justification: savedRow.justification || '',
+      vpComments: savedRow.vpComments || '',
+      createdAt: savedRow.createdAt,
+      updatedAt: savedRow.updatedAt
+    };
+    merged.threshold = normalizeLowEnrollmentNumber(merged.threshold);
+    merged.initialEnrollment = normalizeLowEnrollmentNumber(merged.initialEnrollment);
+    merged.currentEnrollment = normalizeLowEnrollmentNumber(merged.currentEnrollment);
+    merged.latestEnrollment = normalizeLowEnrollmentNumber(merged.latestEnrollment);
+    merged.highestEnrollment = normalizeLowEnrollmentNumber(merged.highestEnrollment);
+    if (merged.latestEnrollment !== null) merged.currentEnrollment = merged.latestEnrollment;
+    merged.status = lowEnrollmentStatusForRow(merged);
+    return merged;
+  });
+}
+
+app.get('/api/low-enrollment-tracking', (req, res) => {
+  try {
+    fs.mkdirSync(LOW_ENROLLMENT_TRACKING_DIR, { recursive: true });
+    const data = fs.readdirSync(LOW_ENROLLMENT_TRACKING_DIR)
+      .filter(file => /^\d{6}\.json$/i.test(file))
+      .map(file => {
+        const termCode = path.basename(file, '.json');
+        const filePath = path.join(LOW_ENROLLMENT_TRACKING_DIR, file);
+        const stats = fs.statSync(filePath);
+        const workspace = readLowEnrollmentWorkspace(termCode);
+        return summarizeLowEnrollmentWorkspace(termCode, workspace || {}, stats);
+      })
+      .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    return res.json({ data });
+  } catch (err) {
+    console.error('Low Enrollment Tracking list error:', err);
+    return sendLowEnrollmentError(res, lowEnrollmentError('Low Enrollment Tracking list failed.', 'STORAGE_FAILURE', 500));
+  }
+});
+
+app.get('/api/low-enrollment-tracking/:termCode', (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  try {
+    const workspace = readLowEnrollmentWorkspace(termCode);
+    if (!workspace) return sendLowEnrollmentError(res, lowEnrollmentError('Low Enrollment Tracking workspace not found.', 'WORKSPACE_NOT_FOUND', 404));
+    return res.json({ termCode, data: workspace });
+  } catch (err) {
+    console.error('Low Enrollment Tracking read error:', err);
+    return sendLowEnrollmentError(res, lowEnrollmentError('Low Enrollment Tracking read failed.', 'STORAGE_FAILURE', 500));
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:termCode', async (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  if (!requireEnrollmentRole(req, res, 'development')) return;
+  try {
+    const result = await withLowEnrollmentTermLock(termCode, async () => {
+      const { workspace, replaceExisting = false } = req.body || {};
+      const prior = readLowEnrollmentWorkspace(termCode);
+      if (prior && replaceExisting !== true) {
+        throw lowEnrollmentError('A Low Enrollment Tracking workspace already exists for this term.', 'WORKSPACE_EXISTS', 409, {
+          requiresConfirmation: true,
+          summary: summarizeLowEnrollmentWorkspace(termCode, prior)
+        });
+      }
+      const normalized = normalizeLowEnrollmentWorkspace(workspace || {}, { prior });
+      const warnings = validateLowEnrollmentWorkspace(normalized, termCode);
+      normalized.validationWarnings = warnings;
+      writeLowEnrollmentWorkspaceAtomic(normalized);
+      return normalized;
+    });
+    return res.json({ success: true, data: result, summary: summarizeLowEnrollmentWorkspace(termCode, result), warnings: result.validationWarnings || [] });
+  } catch (err) {
+    console.error('Low Enrollment Tracking import error:', err?.code || err?.message || err);
+    return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking import failed');
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:termCode/snapshots', async (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  if (!requireEnrollmentRole(req, res, 'development')) return;
+  try {
+    const result = await withLowEnrollmentTermLock(termCode, async () => {
+      const { snapshot, uploadHistory, rows, replaceExisting = false } = req.body || {};
+      const workspace = readLowEnrollmentWorkspace(termCode);
+      const snapshotDate = validateLowEnrollmentSnapshotRequest(workspace, snapshot, rows, replaceExisting);
+      const normalizedSnapshot = { ...snapshot, snapshotDate };
+      workspace.snapshots = [...(workspace.snapshots || []).filter(item => String(item.snapshotDate) !== snapshotDate), normalizedSnapshot]
+        .sort((a, b) => String(a.snapshotDate).localeCompare(String(b.snapshotDate)));
+      workspace.rows = mergeLowEnrollmentSnapshotRows(workspace.rows || [], rows);
+      if (uploadHistory && typeof uploadHistory === 'object') {
+        const normalizedHistory = { ...uploadHistory, type: uploadHistory.type || 'snapshot', snapshotDate };
+        workspace.uploadHistory = [...(workspace.uploadHistory || []).filter(item => !(item.type === normalizedHistory.type && item.snapshotDate === snapshotDate)), normalizedHistory];
+      }
+      workspace.updatedAt = new Date().toISOString();
+      workspace.validationWarnings = lowEnrollmentValidationWarnings(workspace.rows);
+      writeLowEnrollmentWorkspaceAtomic(workspace);
+      return workspace;
+    });
+    return res.json({ success: true, data: result, summary: summarizeLowEnrollmentWorkspace(termCode, result), warnings: result.validationWarnings || [] });
+  } catch (err) {
+    console.error('Low Enrollment Tracking snapshot error:', err?.code || err?.message || err);
+    return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking snapshot save failed');
+  }
+});
+
+app.patch('/api/low-enrollment-tracking/:termCode/rows/:rowId', async (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  const rowId = String(req.params.rowId || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  if (!requireEnrollmentRole(req, res, 'development')) return;
+  try {
+    const result = await withLowEnrollmentTermLock(termCode, async () => {
+      const workspace = readLowEnrollmentWorkspace(termCode);
+      if (!workspace) throw lowEnrollmentError('Low Enrollment Tracking workspace not found.', 'WORKSPACE_NOT_FOUND', 404);
+      const attemptedFields = Object.keys(req.body || {});
+      const disallowedFields = attemptedFields.filter(field => !LOW_ENROLLMENT_EDITABLE_FIELDS.has(field));
+      if (disallowedFields.length || !attemptedFields.length) {
+        throw lowEnrollmentError(`Unsupported update field(s): ${disallowedFields.join(', ') || 'none'}.`, 'INVALID_ROW_UPDATE', 400);
+      }
+      const row = (workspace.rows || []).find(item => String(item.id) === rowId);
+      if (!row) throw lowEnrollmentError('Tracker row not found.', 'ROW_NOT_FOUND', 404);
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, 'justification')) {
+        const nextJustification = String(req.body.justification || '').trim();
+        const allowedReasons = lowEnrollmentAllowedReasons(workspace);
+        if (nextJustification.length > 500) throw lowEnrollmentError('Justification is too long.', 'INVALID_JUSTIFICATION', 400);
+        if (nextJustification && !allowedReasons.includes(nextJustification)) {
+          throw lowEnrollmentError('Invalid justification for this tracker workspace.', 'INVALID_JUSTIFICATION', 400);
+        }
+        row.justification = nextJustification;
+      }
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, 'vpComments')) {
+        if (typeof req.body.vpComments !== 'string') throw lowEnrollmentError('VP comments must be a string.', 'INVALID_ROW_UPDATE', 400);
+        if (req.body.vpComments.length > 10000) throw lowEnrollmentError('VP comments are too long.', 'INVALID_ROW_UPDATE', 400);
+        row.vpComments = req.body.vpComments;
+      }
+      row.updatedAt = new Date().toISOString();
+      workspace.updatedAt = new Date().toISOString();
+      writeLowEnrollmentWorkspaceAtomic(workspace);
+      return { workspace, row };
+    });
+    return res.json({
+      success: true,
+      row: result.row,
+      updatedAt: result.workspace.updatedAt,
+      data: { row: result.row, workspaceUpdatedAt: result.workspace.updatedAt }
+    });
+  } catch (err) {
+    console.error('Low Enrollment Tracking row update error:', err?.code || err?.message || err);
+    return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking row update failed');
   }
 });
 
