@@ -94,6 +94,7 @@ const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
+const LOW_ENROLLMENT_TRACKING_DIR = path.join(DATA_DIR, 'low-enrollment-tracking');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -105,6 +106,9 @@ if (!fs.existsSync(FACULTY_SCHEDULES_DIR)) {
 }
 if (!fs.existsSync(WORK_EXPERIENCE_DIR)) {
   fs.mkdirSync(WORK_EXPERIENCE_DIR, { recursive: true });
+}
+if (!fs.existsSync(LOW_ENROLLMENT_TRACKING_DIR)) {
+  fs.mkdirSync(LOW_ENROLLMENT_TRACKING_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -149,6 +153,13 @@ function getWorkExperiencePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(WORK_EXPERIENCE_DIR, `${term}.json`);
   const dataRoot = path.resolve(WORK_EXPERIENCE_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function getLowEnrollmentTrackingPath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(LOW_ENROLLMENT_TRACKING_DIR, `${term}.json`);
+  const dataRoot = path.resolve(LOW_ENROLLMENT_TRACKING_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
@@ -1468,6 +1479,186 @@ app.delete('/api/work-experience/:term', (req, res) => {
   } catch (err) {
     console.error('Work Experience archive delete error:', err);
     return res.status(500).json({ error: 'Work Experience archive delete failed' });
+  }
+});
+
+function readLowEnrollmentWorkspace(term) {
+  const filePath = getLowEnrollmentTrackingPath(term);
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function lowEnrollmentWorkspaceSummary(term, workspace, stats = null) {
+  const rows = Array.isArray(workspace?.rows) ? workspace.rows : [];
+  const snapshots = Array.isArray(workspace?.snapshots) ? workspace.snapshots : [];
+  const history = Array.isArray(workspace?.uploadHistory) ? workspace.uploadHistory : [];
+  const crns = new Set();
+  rows.forEach(row => (Array.isArray(row.crns) ? row.crns : []).forEach(crn => crn && crns.add(String(crn))));
+  return {
+    termCode: workspace?.termCode || term,
+    displayTerm: workspace?.displayTerm || workspace?.termName || term,
+    sourceFilename: workspace?.sourceFilename || '',
+    initialSnapshotDate: workspace?.initialSnapshotDate || '',
+    createdAt: workspace?.createdAt || stats?.birthtime?.toISOString?.() || '',
+    updatedAt: workspace?.updatedAt || stats?.mtime?.toISOString?.() || '',
+    rowCount: rows.length,
+    crnCount: crns.size,
+    snapshotCount: snapshots.length,
+    uploadHistoryCount: history.length
+  };
+}
+
+function validateLowEnrollmentWorkspace(workspace) {
+  if (!workspace || typeof workspace !== 'object') return 'Workspace payload is required.';
+  if (!workspace.termCode || !/^[a-z0-9 _-]+$/i.test(String(workspace.termCode))) return 'A valid term code is required.';
+  if (!Array.isArray(workspace.rows) || !workspace.rows.length) return 'Tracker rows are required.';
+  const missingCrns = workspace.rows.filter(row => !Array.isArray(row.crns) || !row.crns.length).length;
+  if (missingCrns) return `${missingCrns} tracker row(s) are missing CRNs.`;
+  return '';
+}
+
+function normalizeLowEnrollmentWorkspace(workspace, base = {}) {
+  const now = new Date().toISOString();
+  const prior = base.prior || {};
+  return {
+    ...workspace,
+    termCode: String(workspace.termCode || '').trim(),
+    displayTerm: String(workspace.displayTerm || workspace.termName || workspace.termCode || '').trim(),
+    status: workspace.status || 'active',
+    sourceFilename: workspace.sourceFilename || '',
+    initialSnapshotDate: workspace.initialSnapshotDate || '',
+    reasons: Array.isArray(workspace.reasons) ? workspace.reasons : [],
+    rows: Array.isArray(workspace.rows) ? workspace.rows : [],
+    snapshots: Array.isArray(workspace.snapshots) ? workspace.snapshots : [],
+    uploadHistory: Array.isArray(workspace.uploadHistory) ? workspace.uploadHistory : [],
+    createdAt: prior.createdAt || workspace.createdAt || now,
+    updatedAt: now,
+    importedAt: workspace.importedAt || now
+  };
+}
+
+function saveLowEnrollmentWorkspace(workspace) {
+  const validationError = validateLowEnrollmentWorkspace(workspace);
+  if (validationError) {
+    const err = new Error(validationError);
+    err.statusCode = 400;
+    throw err;
+  }
+  const filePath = getLowEnrollmentTrackingPath(workspace.termCode);
+  if (!filePath) {
+    const err = new Error('Invalid term code.');
+    err.statusCode = 400;
+    throw err;
+  }
+  fs.writeFileSync(filePath, JSON.stringify(workspace, null, 2));
+  return workspace;
+}
+
+app.get('/api/low-enrollment-tracking', (req, res) => {
+  try {
+    const data = fs.readdirSync(LOW_ENROLLMENT_TRACKING_DIR)
+      .filter(file => file.toLowerCase().endsWith('.json'))
+      .map(file => {
+        const term = path.basename(file, '.json');
+        const filePath = path.join(LOW_ENROLLMENT_TRACKING_DIR, file);
+        const stats = fs.statSync(filePath);
+        const workspace = readLowEnrollmentWorkspace(term);
+        return lowEnrollmentWorkspaceSummary(term, workspace || {}, stats);
+      })
+      .sort((a, b) => String(a.displayTerm || a.termCode).localeCompare(String(b.displayTerm || b.termCode), undefined, { numeric: true }));
+    return res.json({ data });
+  } catch (err) {
+    console.error('Low Enrollment Tracking list error:', err);
+    return res.status(500).json({ error: 'Low Enrollment Tracking list failed' });
+  }
+});
+
+app.get('/api/low-enrollment-tracking/:term', (req, res) => {
+  const term = req.params.term;
+  const filePath = getLowEnrollmentTrackingPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  if (!fs.existsSync(filePath)) return res.json({ termCode: term, data: null });
+  try {
+    const workspace = readLowEnrollmentWorkspace(term);
+    return res.json({ termCode: term, data: workspace });
+  } catch (err) {
+    console.error('Low Enrollment Tracking read error:', err);
+    return res.status(500).json({ error: 'Low Enrollment Tracking read failed' });
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:term', (req, res) => {
+  const term = req.params.term;
+  const { workspace, password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getLowEnrollmentTrackingPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    const prior = readLowEnrollmentWorkspace(term);
+    const normalized = normalizeLowEnrollmentWorkspace({ ...(workspace || {}), termCode: term }, { prior });
+    saveLowEnrollmentWorkspace(normalized);
+    return res.json({ success: true, data: normalized, summary: lowEnrollmentWorkspaceSummary(term, normalized) });
+  } catch (err) {
+    console.error('Low Enrollment Tracking import error:', err);
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Low Enrollment Tracking import failed' });
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:term/snapshots', (req, res) => {
+  const term = req.params.term;
+  const { snapshot, uploadHistory, rows, password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getLowEnrollmentTrackingPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    const workspace = readLowEnrollmentWorkspace(term);
+    if (!workspace) return res.status(404).json({ error: 'Low Enrollment Tracking workspace not found' });
+    if (!snapshot?.snapshotDate) return res.status(400).json({ error: 'Snapshot date is required' });
+    const snapshotDate = String(snapshot.snapshotDate);
+    const nextSnapshots = (workspace.snapshots || []).filter(item => String(item.snapshotDate) !== snapshotDate);
+    nextSnapshots.push(snapshot);
+    nextSnapshots.sort((a, b) => String(a.snapshotDate).localeCompare(String(b.snapshotDate)));
+    workspace.snapshots = nextSnapshots;
+    if (Array.isArray(rows)) workspace.rows = rows;
+    if (uploadHistory) {
+      workspace.uploadHistory = [...(workspace.uploadHistory || []).filter(item => !(item.type === 'snapshot' && item.snapshotDate === snapshotDate)), uploadHistory];
+    }
+    workspace.updatedAt = new Date().toISOString();
+    saveLowEnrollmentWorkspace(workspace);
+    return res.json({ success: true, data: workspace, summary: lowEnrollmentWorkspaceSummary(term, workspace) });
+  } catch (err) {
+    console.error('Low Enrollment Tracking snapshot error:', err);
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Low Enrollment Tracking snapshot save failed' });
+  }
+});
+
+app.patch('/api/low-enrollment-tracking/:term/rows/:rowId', (req, res) => {
+  const term = req.params.term;
+  const rowId = req.params.rowId;
+  const { justification, vpComments, password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const filePath = getLowEnrollmentTrackingPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    const workspace = readLowEnrollmentWorkspace(term);
+    if (!workspace) return res.status(404).json({ error: 'Low Enrollment Tracking workspace not found' });
+    const row = (workspace.rows || []).find(item => String(item.id) === String(rowId));
+    if (!row) return res.status(404).json({ error: 'Tracker row not found' });
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'justification')) row.justification = String(justification || '');
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'vpComments')) row.vpComments = String(vpComments || '');
+    row.updatedAt = new Date().toISOString();
+    workspace.updatedAt = new Date().toISOString();
+    saveLowEnrollmentWorkspace(workspace);
+    return res.json({ success: true, row, updatedAt: workspace.updatedAt });
+  } catch (err) {
+    console.error('Low Enrollment Tracking row update error:', err);
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Low Enrollment Tracking row update failed' });
   }
 });
 
