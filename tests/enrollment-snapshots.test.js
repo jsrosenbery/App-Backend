@@ -85,9 +85,24 @@ test('backend enrollment snapshot endpoints append, update, list, and delete sel
     assert.equal(second.payload.data.find(record => record.crn === '10001').enrollment, 24);
     assert.equal(second.payload.data.find(record => record.crn === '10002').enrollment, 18);
 
+    const custom = await jsonRequest(baseUrl, '/api/enrollment-snapshots', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        records: [
+          { term: 'Fall 2027', crn: '10001', snapshotType: 'Custom', snapshotDate: '2027-07-30', enrollment: 10 },
+          { term: 'Fall 2027', crn: '10001', snapshotType: 'Custom', snapshotDate: '2027-08-06', enrollment: 12 }
+        ]
+      })
+    });
+    assert.equal(custom.response.status, 200);
+    assert.equal(custom.payload.appended, 2);
+    assert.equal(custom.payload.updated, 0);
+    assert.equal(custom.payload.data.filter(record => record.crn === '10001' && record.snapshotType === 'CUSTOM').length, 2);
+
     const listed = await jsonRequest(baseUrl, '/api/enrollment-snapshots');
     assert.equal(listed.response.status, 200);
-    assert.equal(listed.payload.data.length, 3);
+    assert.equal(listed.payload.data.length, 5);
     assert.ok(fs.existsSync(path.join(dataDir, 'enrollment-snapshots.json')));
 
     const deleted = await jsonRequest(baseUrl, '/api/enrollment-snapshots', {
@@ -98,7 +113,7 @@ test('backend enrollment snapshot endpoints append, update, list, and delete sel
     assert.equal(deleted.response.status, 200);
     assert.equal(deleted.payload.deleted, 1);
     assert.equal(deleted.payload.removed, 1);
-    assert.equal(deleted.payload.data.length, 2);
+    assert.equal(deleted.payload.data.length, 4);
     assert.equal(deleted.payload.data.some(record => record.crn === '10002'), false);
     assert.equal(deleted.payload.data.some(record => record.crn === '10001'), true);
     assert.equal(deleted.payload.data.some(record => record.crn === '10003'), true);
