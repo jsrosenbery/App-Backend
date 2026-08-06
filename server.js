@@ -150,8 +150,9 @@ function displayTermFromArchiveTerm(term) {
   if (codeMatch) {
     const year = Number(codeMatch[1]);
     const seasonCode = codeMatch[2];
-    const season = seasonCode === '10' ? 'Spring' : seasonCode === '30' ? 'Summer' : seasonCode === '50' ? 'Fall' : '';
-    if (season) return `${season} ${year}`;
+    if (seasonCode === '10') return `Fall ${year - 1}`;
+    if (seasonCode === '20') return `Spring ${year}`;
+    if (seasonCode === '30') return `Summer ${year}`;
   }
   return value.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -162,7 +163,7 @@ function archiveTermSortValue(term) {
   if (codeMatch) {
     const year = Number(codeMatch[1]);
     const seasonCode = codeMatch[2];
-    const seasonOrder = seasonCode === '10' ? 1 : seasonCode === '30' ? 2 : seasonCode === '50' ? 3 : 0;
+    const seasonOrder = seasonCode === '10' ? 1 : seasonCode === '20' ? 2 : seasonCode === '30' ? 3 : 0;
     return year * 10 + seasonOrder;
   }
   const labelMatch = value.match(/\b(SPRING|SUMMER|FALL)\b\D*(\d{4})/i) || value.match(/\b(\d{4})\D*(SPRING|SUMMER|FALL)\b/i);

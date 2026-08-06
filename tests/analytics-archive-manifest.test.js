@@ -11,7 +11,7 @@ process.env.DATA_DIR = dataDir;
 process.env.UPLOAD_PASSWORD = 'Upload2025';
 process.env.DEV_PASSWORD = 'DevSecret';
 
-const { app, sortArchiveTermsNewestFirst } = require('../server');
+const { app, displayTermFromArchiveTerm, sortArchiveTermsNewestFirst } = require('../server');
 
 test.after(() => {
   fs.rmSync(dataRoot, { recursive: true, force: true });
@@ -104,12 +104,23 @@ test('Analytics archive replacement updates manifest metadata and corrupt manife
 
 test('Analytics archive manifest sorting uses newest academic term order', () => {
   const sorted = sortArchiveTermsNewestFirst([
-    { termCode: 'SPRING 2026' },
-    { termCode: 'FALL 2025' },
-    { termCode: 'SUMMER 2026' },
-    { termCode: 'FALL 2026' }
+    { termCode: '202610' },
+    { termCode: '202620' },
+    { termCode: '202630' },
+    { termCode: '202710' },
+    { termCode: '202720' },
+    { termCode: '202730' }
   ]);
-  assert.deepEqual(sorted.map(term => term.termCode), ['FALL 2026', 'SUMMER 2026', 'SPRING 2026', 'FALL 2025']);
+  assert.deepEqual(sorted.map(term => term.termCode), ['202730', '202720', '202710', '202630', '202620', '202610']);
+});
+
+test('Analytics archive manifest displays Banner term codes using TIMBER conventions', () => {
+  assert.equal(displayTermFromArchiveTerm('202710'), 'Fall 2026');
+  assert.equal(displayTermFromArchiveTerm('202720'), 'Spring 2027');
+  assert.equal(displayTermFromArchiveTerm('202730'), 'Summer 2027');
+  assert.equal(displayTermFromArchiveTerm('202610'), 'Fall 2025');
+  assert.equal(displayTermFromArchiveTerm('202620'), 'Spring 2026');
+  assert.equal(displayTermFromArchiveTerm('202630'), 'Summer 2026');
 });
 
 test('Analytics archive manifest implementation uses atomic writes and avoids filesystem paths', () => {
