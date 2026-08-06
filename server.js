@@ -92,6 +92,8 @@ const EMAIL_RATE_LIMIT_WINDOW_MS = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE
 const EMAIL_RATE_LIMIT_MAX = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_MAX || 20);
 const emailRateLimit = new Map();
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
+const ANALYTICS_ARCHIVE_MANIFEST_PATH = path.join(ANALYTICS_ARCHIVE_DIR, 'manifest.json');
+const ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1;
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
 const LOW_ENROLLMENT_TRACKING_DIR = path.join(DATA_DIR, 'low-enrollment-tracking');
@@ -140,6 +142,154 @@ function getAnalyticsArchivePath(term) {
   const filePath = path.resolve(ANALYTICS_ARCHIVE_DIR, `${term}.csv`);
   const dataRoot = path.resolve(ANALYTICS_ARCHIVE_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function displayTermFromArchiveTerm(term) {
+  const value = String(term || '').trim();
+  const codeMatch = value.match(/^(\d{4})(\d{2})$/);
+  if (codeMatch) {
+    const year = Number(codeMatch[1]);
+    const seasonCode = codeMatch[2];
+    if (seasonCode === '10') return `Fall ${year - 1}`;
+    if (seasonCode === '20') return `Spring ${year}`;
+    if (seasonCode === '30') return `Summer ${year}`;
+  }
+  return value.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function archiveTermSortValue(term) {
+  const value = String(term || '').trim().toUpperCase();
+  const codeMatch = value.match(/^(\d{4})(\d{2})$/);
+  if (codeMatch) {
+    const year = Number(codeMatch[1]);
+    const seasonCode = codeMatch[2];
+    const seasonOrder = seasonCode === '10' ? 1 : seasonCode === '20' ? 2 : seasonCode === '30' ? 3 : 0;
+    return year * 10 + seasonOrder;
+  }
+  const labelMatch = value.match(/\b(SPRING|SUMMER|FALL)\b\D*(\d{4})/i) || value.match(/\b(\d{4})\D*(SPRING|SUMMER|FALL)\b/i);
+  if (labelMatch) {
+    const season = (Number(labelMatch[2]) ? labelMatch[1] : labelMatch[2]).toUpperCase();
+    const year = Number(Number(labelMatch[2]) ? labelMatch[2] : labelMatch[1]);
+    const seasonOrder = season === 'SPRING' ? 1 : season === 'SUMMER' ? 2 : season === 'FALL' ? 3 : 0;
+    return year * 10 + seasonOrder;
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+function sortArchiveTermsNewestFirst(terms = []) {
+  return terms.slice().sort((a, b) => {
+    const av = archiveTermSortValue(a.termCode || a.term || '');
+    const bv = archiveTermSortValue(b.termCode || b.term || '');
+    return bv - av || String(b.termCode || b.term || '').localeCompare(String(a.termCode || a.term || ''), undefined, { numeric: true });
+  });
+}
+
+function atomicWriteJson(filePath, payload) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2));
+  fs.renameSync(tempPath, filePath);
+}
+
+function analyticsArchiveRowCountFromCsv(csv) {
+  if (typeof csv !== 'string' || !csv.trim()) return 0;
+  const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true, preview: 0 });
+  return Array.isArray(parsed.data) ? parsed.data.length : 0;
+}
+
+function normalizeArchiveManifestEntry(entry = {}, stats = null) {
+  const termCode = String(entry.termCode || entry.term || '').trim();
+  if (!termCode) return null;
+  return {
+    termCode,
+    displayTerm: String(entry.displayTerm || displayTermFromArchiveTerm(termCode)).trim(),
+    rowCount: Number.isFinite(Number(entry.rowCount)) ? Number(entry.rowCount) : null,
+    updatedAt: String(entry.updatedAt || entry.lastUpdated || stats?.mtime?.toISOString?.() || '').trim(),
+    sizeBytes: Number.isFinite(Number(entry.sizeBytes)) ? Number(entry.sizeBytes) : (stats ? stats.size : null),
+    hasArchive: entry.hasArchive !== false,
+    schemaVersion: entry.schemaVersion || 'csv-v1'
+  };
+}
+
+function readAnalyticsArchiveManifestFile() {
+  if (!fs.existsSync(ANALYTICS_ARCHIVE_MANIFEST_PATH)) return null;
+  try {
+    const payload = JSON.parse(fs.readFileSync(ANALYTICS_ARCHIVE_MANIFEST_PATH, 'utf8'));
+    if (!payload || payload.schemaVersion !== ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION || !Array.isArray(payload.terms)) return null;
+    return {
+      schemaVersion: ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION,
+      generatedAt: payload.generatedAt || new Date().toISOString(),
+      terms: sortArchiveTermsNewestFirst(payload.terms.map(term => normalizeArchiveManifestEntry(term)).filter(Boolean))
+    };
+  } catch (err) {
+    console.warn('Analytics archive manifest invalid; rebuilding:', err.message || err);
+    return null;
+  }
+}
+
+function writeAnalyticsArchiveManifest(terms = []) {
+  const existingFiles = new Set(
+    fs.readdirSync(ANALYTICS_ARCHIVE_DIR)
+      .filter(file => file.toLowerCase().endsWith('.csv'))
+      .map(file => path.basename(file, '.csv'))
+  );
+  const payload = {
+    schemaVersion: ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION,
+    generatedAt: new Date().toISOString(),
+    terms: sortArchiveTermsNewestFirst(terms
+      .map(term => normalizeArchiveManifestEntry(term))
+      .filter(term => term && existingFiles.has(term.termCode))
+      .map(term => ({ ...term, hasArchive: true })))
+  };
+  atomicWriteJson(ANALYTICS_ARCHIVE_MANIFEST_PATH, payload);
+  return payload;
+}
+
+function rebuildAnalyticsArchiveManifest() {
+  const terms = fs.readdirSync(ANALYTICS_ARCHIVE_DIR)
+    .filter(file => file.toLowerCase().endsWith('.csv'))
+    .map(file => {
+      const termCode = path.basename(file, '.csv');
+      const filePath = path.join(ANALYTICS_ARCHIVE_DIR, file);
+      const stats = fs.statSync(filePath);
+      let rowCount = null;
+      try {
+        rowCount = analyticsArchiveRowCountFromCsv(fs.readFileSync(filePath, 'utf8'));
+      } catch (err) {
+        console.warn(`Analytics archive manifest row count skipped for ${termCode}:`, err.message || err);
+      }
+      return normalizeArchiveManifestEntry({ termCode, rowCount, updatedAt: stats.mtime.toISOString(), sizeBytes: stats.size }, stats);
+    })
+    .filter(Boolean);
+  return writeAnalyticsArchiveManifest(terms);
+}
+
+function readAnalyticsArchiveManifest() {
+  const manifest = readAnalyticsArchiveManifestFile();
+  if (manifest) {
+    const files = new Set(fs.readdirSync(ANALYTICS_ARCHIVE_DIR).filter(file => file.toLowerCase().endsWith('.csv')).map(file => path.basename(file, '.csv')));
+    const complete = manifest.terms.every(term => files.has(term.termCode));
+    const includesAll = Array.from(files).every(termCode => manifest.terms.some(term => term.termCode === termCode));
+    if (complete && includesAll) return manifest;
+  }
+  return rebuildAnalyticsArchiveManifest();
+}
+
+function updateAnalyticsArchiveManifestEntry(term, csv) {
+  const termCode = String(term || '').trim();
+  const filePath = getAnalyticsArchivePath(termCode);
+  if (!filePath || !fs.existsSync(filePath)) return readAnalyticsArchiveManifest();
+  const stats = fs.statSync(filePath);
+  const existing = readAnalyticsArchiveManifestFile() || { terms: [] };
+  const next = existing.terms.filter(item => item.termCode !== termCode);
+  next.push(normalizeArchiveManifestEntry({
+    termCode,
+    displayTerm: displayTermFromArchiveTerm(termCode),
+    rowCount: analyticsArchiveRowCountFromCsv(csv),
+    updatedAt: stats.mtime.toISOString(),
+    sizeBytes: stats.size,
+    hasArchive: true
+  }, stats));
+  return writeAnalyticsArchiveManifest(next);
 }
 
 function getFacultySchedulePath(term) {
@@ -1159,21 +1309,24 @@ app.get('/api/schedule/:term', (req, res) => {
 
 app.get('/api/analytics-archive', (req, res) => {
   try {
-    const terms = fs.readdirSync(ANALYTICS_ARCHIVE_DIR)
-      .filter(file => file.toLowerCase().endsWith('.csv'))
-      .map(file => {
-        const filePath = path.join(ANALYTICS_ARCHIVE_DIR, file);
-        const stats = fs.statSync(filePath);
-        return {
-          term: path.basename(file, '.csv'),
-          lastUpdated: stats.mtime.toISOString()
-        };
-      })
-      .sort((a, b) => a.term.localeCompare(b.term, undefined, { numeric: true }));
+    const manifest = readAnalyticsArchiveManifest();
+    const terms = manifest.terms.map(term => ({
+      term: term.termCode,
+      lastUpdated: term.updatedAt
+    }));
     return res.json({ data: terms });
   } catch (err) {
     console.error('Analytics archive list error:', err);
     return res.status(500).json({ error: 'Analytics archive list failed' });
+  }
+});
+
+app.get('/api/analytics-archive/manifest', (req, res) => {
+  try {
+    return res.json({ data: readAnalyticsArchiveManifest() });
+  } catch (err) {
+    console.error('Analytics archive manifest error:', err);
+    return res.status(500).json({ error: 'Analytics archive manifest failed' });
   }
 });
 
@@ -1931,8 +2084,9 @@ app.post('/api/analytics-archive/:term', (req, res) => {
   }
   try {
     fs.writeFileSync(filePath, csv);
-    const now = new Date().toISOString();
-    return res.json({ success: true, term, lastUpdated: now });
+    const manifest = updateAnalyticsArchiveManifestEntry(term, csv);
+    const entry = manifest.terms.find(item => item.termCode === String(term || '').trim());
+    return res.json({ success: true, term, lastUpdated: entry?.updatedAt || new Date().toISOString(), metadata: entry || null });
   } catch (err) {
     console.error('Analytics archive write error:', err);
     return res.status(500).json({ error: 'Analytics archive write failed' });
@@ -2159,5 +2313,11 @@ module.exports = {
   convertDocxToPdf,
   runCommand,
   validateWorkExperienceRows,
-  workExperienceMetadata
+  workExperienceMetadata,
+  displayTermFromArchiveTerm,
+  archiveTermSortValue,
+  sortArchiveTermsNewestFirst,
+  readAnalyticsArchiveManifest,
+  rebuildAnalyticsArchiveManifest,
+  updateAnalyticsArchiveManifestEntry
 };
