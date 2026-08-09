@@ -65,6 +65,7 @@ app.use(express.json({ limit: '50mb' }));
 const configuredDataDir = process.env.DATA_DIR || process.env.SCHEDULE_DATA_DIR;
 const renderDiskDataDir = fs.existsSync('/var/data') ? path.join('/var/data', 'cos-app') : '';
 const hostedRuntime = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+if (hostedRuntime) app.set('trust proxy', 1);
 if (hostedRuntime && !configuredDataDir && !renderDiskDataDir) {
   console.error('Persistent upload storage is not configured. Set DATA_DIR or SCHEDULE_DATA_DIR to a mounted persistent disk path.');
   process.exit(1);
@@ -91,6 +92,15 @@ const MAX_EMAIL_PAYLOAD_BYTES = Number(process.env.MAX_SCHEDULE_CHANGE_EMAIL_BYT
 const EMAIL_RATE_LIMIT_WINDOW_MS = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_WINDOW_MS || 15 * 60 * 1000);
 const EMAIL_RATE_LIMIT_MAX = Number(process.env.SCHEDULE_CHANGE_EMAIL_RATE_MAX || 20);
 const emailRateLimit = new Map();
+const AUTH_FAILURE_LIMIT = Number(process.env.AUTH_FAILURE_LIMIT || 5);
+const AUTH_FAILURE_WINDOW_MS = Number(process.env.AUTH_FAILURE_WINDOW_MS || 15 * 60 * 1000);
+const AUTH_LOCKOUT_MS = Number(process.env.AUTH_LOCKOUT_MS || 15 * 60 * 1000);
+const authFailureState = new Map();
+const CONVERSION_RATE_LIMIT_WINDOW_MS = Number(process.env.CONVERSION_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
+const CONVERSION_RATE_LIMIT_MAX = Number(process.env.CONVERSION_RATE_LIMIT_MAX || 10);
+const CONVERSION_MAX_CONCURRENT = Math.max(1, Number(process.env.CONVERSION_MAX_CONCURRENT || 3));
+const conversionRateLimit = new Map();
+let activeConversions = 0;
 const ANALYTICS_ARCHIVE_DIR = path.join(DATA_DIR, 'analytics-archive');
 const ANALYTICS_ARCHIVE_MANIFEST_PATH = path.join(ANALYTICS_ARCHIVE_DIR, 'manifest.json');
 const ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1;
@@ -114,20 +124,16 @@ if (!fs.existsSync(LOW_ENROLLMENT_TRACKING_DIR)) {
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
-  { code: 'IP', modality: 'In Person', omitted: false },
-  { code: 'ONL', modality: 'Online', omitted: false },
-  { code: 'HYB', modality: 'Hybrid', omitted: false },
+  ...['ONL', '71', '72', 'O1', 'OL', 'ONN', 'ONS', 'OO', 'OS', 'OSS', 'OT', 'OTS', 'ON', 'OSL']
+    .map(code => ({ code, modality: 'Online', omitted: false })),
+  ...['IP', '02', '22', '022', '02H', '02O', '02S', '02T', '02N', '04', '06', '07', '08', '09', '12', 'XX', 'YY']
+    .map(code => ({ code, modality: 'In-Person', omitted: false })),
+  ...['HYB', 'OH', 'OHF', 'FLX', 'OHS']
+    .map(code => ({ code, modality: 'Hybrid', omitted: false })),
   { code: 'DE', modality: 'Dual Enrollment', omitted: false },
-  { code: 'FLX', modality: 'Flex', omitted: false },
-  { code: '02S', modality: 'In Person', omitted: false },
-  { code: '022', modality: 'In Person', omitted: false },
-  { code: 'OL', modality: 'Online', omitted: false },
-  { code: 'ONN', modality: 'Online', omitted: false },
-  { code: 'O1', modality: 'Online', omitted: false },
-  { code: 'ONS', modality: 'Online', omitted: false },
-  { code: '02N', modality: 'In Person', omitted: false },
-  { code: 'CPL', modality: 'Omitted from modality analysis', omitted: true },
-  { code: '20', modality: 'Omitted from modality analysis', omitted: true }
+  { code: '20', modality: 'Work Experience', omitted: false },
+  ...['CPL', 'CBE', '98']
+    .map(code => ({ code, modality: 'Omitted from modality analysis', omitted: true }))
 ];
 
 function getSchedulePath(term) {
@@ -337,6 +343,40 @@ function authenticateRolePassword(password, minimumRole = 'general') {
     }
   }
   return '';
+}
+
+function requestClientKey(req, scope) {
+  return `${scope}:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+}
+
+function checkAuthenticationLock(req) {
+  const key = requestClientKey(req, 'auth');
+  const now = Date.now();
+  const state = authFailureState.get(key);
+  if (!state) return key;
+  if (state.lockedUntil > now) {
+    const err = new Error('Too many failed sign-in attempts. Please wait before trying again.');
+    err.status = 429;
+    err.retryAfterSeconds = Math.max(1, Math.ceil((state.lockedUntil - now) / 1000));
+    throw err;
+  }
+  if (now - state.firstFailureAt >= AUTH_FAILURE_WINDOW_MS) authFailureState.delete(key);
+  return key;
+}
+
+function recordAuthenticationFailure(key) {
+  const now = Date.now();
+  const current = authFailureState.get(key);
+  const state = !current || now - current.firstFailureAt >= AUTH_FAILURE_WINDOW_MS
+    ? { failures: 0, firstFailureAt: now, lockedUntil: 0 }
+    : current;
+  state.failures += 1;
+  if (state.failures >= AUTH_FAILURE_LIMIT) state.lockedUntil = now + AUTH_LOCKOUT_MS;
+  authFailureState.set(key, state);
+}
+
+function clearAuthenticationFailures(key) {
+  authFailureState.delete(key);
 }
 
 function issueEnrollmentSession(role = 'em') {
@@ -886,7 +926,8 @@ function exportCapabilities() {
     pdfConversionAvailable: Boolean(DOCX_PDF_CAPABILITY.available),
     pdfConversionUnavailableReason: DOCX_PDF_CAPABILITY.available ? '' : DOCX_PDF_CAPABILITY.reason,
     converter: DOCX_PDF_CAPABILITY.converter,
-    emailDraftSupported: true,
+    emailDraftSupported: MICROSOFT_GRAPH_DRAFT_SUPPORTED,
+    localEmailDraftSupported: true,
     microsoftGraphDraftSupported: MICROSOFT_GRAPH_DRAFT_SUPPORTED,
     mailtoFallbackSupported: true,
     directBackendSendSupported: DIRECT_BACKEND_SEND_SUPPORTED,
@@ -1018,6 +1059,7 @@ async function createScheduleChangeEmailDraft(_email) {
 }
 
 app.post('/api/schedule-change/create-email-draft', (req, res) => {
+  if (!requireEnrollmentRole(req, res, 'general')) return;
   const timestamp = new Date().toISOString();
   let audit = {
     timestamp,
@@ -1070,6 +1112,7 @@ app.post('/api/schedule-change/create-email-draft', (req, res) => {
 });
 
 app.post('/api/schedule-change/send-email', (req, res) => {
+  if (!requireEnrollmentRole(req, res, 'general')) return;
   const timestamp = new Date().toISOString();
   let audit = {
     timestamp,
@@ -1163,6 +1206,20 @@ function decodeDocxPayload(req) {
   return { inputName, buffer };
 }
 
+function checkConversionRateLimit(req) {
+  const key = requestClientKey(req, 'conversion');
+  const now = Date.now();
+  const recent = (conversionRateLimit.get(key) || []).filter(timestamp => now - timestamp < CONVERSION_RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= CONVERSION_RATE_LIMIT_MAX) {
+    const err = new Error('Too many document conversion requests. Please wait and try again.');
+    err.status = 429;
+    err.retryAfterSeconds = Math.max(1, Math.ceil((CONVERSION_RATE_LIMIT_WINDOW_MS - (now - recent[0])) / 1000));
+    throw err;
+  }
+  recent.push(now);
+  conversionRateLimit.set(key, recent);
+}
+
 async function handleScheduleChangeDocxToPdf(req, res) {
   if (!DOCX_PDF_CAPABILITY.available) {
     return res.status(503).json({
@@ -1171,6 +1228,23 @@ async function handleScheduleChangeDocxToPdf(req, res) {
       capabilities: exportCapabilities()
     });
   }
+  try {
+    checkConversionRateLimit(req);
+  } catch (err) {
+    res.setHeader('Retry-After', String(err.retryAfterSeconds || Math.ceil(CONVERSION_RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.status(429).json({ error: err.message, code: 'CONVERSION_RATE_LIMITED' });
+  }
+  if (activeConversions >= CONVERSION_MAX_CONCURRENT) {
+    res.setHeader('Retry-After', '10');
+    return res.status(503).json({ error: 'Document conversion is busy. Please try again shortly.', code: 'CONVERSION_BUSY' });
+  }
+  activeConversions += 1;
+  let conversionSlotHeld = true;
+  const releaseConversionSlot = () => {
+    if (!conversionSlotHeld) return;
+    conversionSlotHeld = false;
+    activeConversions = Math.max(0, activeConversions - 1);
+  };
 
   const requestId = crypto.randomBytes(12).toString('hex');
   const requestDir = path.join(CONVERT_DIR, requestId);
@@ -1200,11 +1274,13 @@ async function handleScheduleChangeDocxToPdf(req, res) {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${contentDispositionFilename(downloadName)}"`);
     return res.sendFile(pdfPath, err => {
+      releaseConversionSlot();
       const cleanup = cleanupConversionDir(requestDir);
       console.log('[DOCX-PDF] Response cleanup:', JSON.stringify({ requestId, cleanup }));
       if (err) console.error('PDF send error:', err);
     });
   } catch (err) {
+    releaseConversionSlot();
     const cleanup = cleanupConversionDir(requestDir);
     const status = err.status || 500;
     if (status >= 500) {
@@ -1236,26 +1312,45 @@ app.get('/api/export-capabilities', (_req, res) => {
   return res.json(exportCapabilities());
 });
 
-app.get('/api/admin/diagnostics', (_req, res) => {
+app.get('/api/admin/diagnostics', (req, res) => {
+  if (!requireEnrollmentRole(req, res, 'admin')) return;
   return res.json(diagnosticsPayload());
 });
 
 app.post('/api/auth/enrollment-management', (req, res) => {
+  let authKey;
+  try {
+    authKey = checkAuthenticationLock(req);
+  } catch (err) {
+    res.setHeader('Retry-After', String(err.retryAfterSeconds || Math.ceil(AUTH_LOCKOUT_MS / 1000)));
+    return res.status(429).json({ error: err.message, code: 'AUTH_LOCKED' });
+  }
   const { password } = req.body || {};
   const role = authenticateRolePassword(password, 'em');
   if (!role) {
+    recordAuthenticationFailure(authKey);
     return res.status(403).json({ error: 'Unauthorized' });
   }
+  clearAuthenticationFailures(authKey);
   return res.json(issueEnrollmentSession(role));
 });
 
 app.post('/api/auth/role', (req, res) => {
+  let authKey;
+  try {
+    authKey = checkAuthenticationLock(req);
+  } catch (err) {
+    res.setHeader('Retry-After', String(err.retryAfterSeconds || Math.ceil(AUTH_LOCKOUT_MS / 1000)));
+    return res.status(429).json({ error: err.message, code: 'AUTH_LOCKED' });
+  }
   const { password, requestedRole = 'general' } = req.body || {};
   const minimumRole = ROLE_LEVEL[requestedRole] ? requestedRole : 'general';
   const role = authenticateRolePassword(password, minimumRole);
   if (!role) {
+    recordAuthenticationFailure(authKey);
     return res.status(403).json({ error: 'Unauthorized', requiredRole: minimumRole });
   }
+  clearAuthenticationFailures(authKey);
   return res.json(issueEnrollmentSession(role));
 });
 
