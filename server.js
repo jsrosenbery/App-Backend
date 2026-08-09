@@ -65,6 +65,7 @@ app.use(express.json({ limit: '50mb' }));
 const configuredDataDir = process.env.DATA_DIR || process.env.SCHEDULE_DATA_DIR;
 const renderDiskDataDir = fs.existsSync('/var/data') ? path.join('/var/data', 'cos-app') : '';
 const hostedRuntime = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+if (hostedRuntime) app.set('trust proxy', 1);
 if (hostedRuntime && !configuredDataDir && !renderDiskDataDir) {
   console.error('Persistent upload storage is not configured. Set DATA_DIR or SCHEDULE_DATA_DIR to a mounted persistent disk path.');
   process.exit(1);
