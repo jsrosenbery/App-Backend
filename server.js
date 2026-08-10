@@ -224,6 +224,86 @@ function atomicWriteJson(filePath, payload) {
   fs.renameSync(tempPath, filePath);
 }
 
+function atomicWriteText(filePath, text) {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, text);
+  fs.renameSync(tempPath, filePath);
+}
+
+function normalizedCsvHeaders(csv) {
+  if (typeof csv !== 'string' || !csv.trim()) return new Set();
+  const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true, preview: 1 });
+  return new Set((parsed.meta?.fields || []).map(field => String(field || '').replace(/[^a-z0-9]/gi, '').toUpperCase()));
+}
+
+function isValidAllColumnsSectionSeatingCsv(csv) {
+  const headers = normalizedCsvHeaders(csv);
+  const has = (...aliases) => aliases.some(alias => headers.has(alias));
+  const core = has('CRN', 'COURSEREFERENCENUMBER') && has('BUILDING') && has('ROOM');
+  const allColumnsSignals = [
+    has('INSTRUCTIONALMETHODCODE', 'INSMCODESSBSECT', 'INSTRUCTIONMETHODDESC'),
+    has('SCHDCODESSRMEET', 'SCHEDULETYPE'),
+    has('ACTUALENROLL', 'CURRENTENROLLMENT'),
+    has('MAXENROLL', 'MAXIMUMENROLLMENT', 'CAPACITY'),
+    has('CAMPUS', 'CAMPUSCODE'),
+    has('FACULTYNAME', 'INSTRUCTOR'),
+    has('XLIST', 'CROSSLIST')
+  ].filter(Boolean).length;
+  return core && allColumnsSignals >= 3;
+}
+
+function selectNewestValidAllColumnsArchive(candidates = []) {
+  return candidates
+    .filter(candidate => candidate && isValidAllColumnsSectionSeatingCsv(candidate.csv))
+    .slice()
+    .sort((a, b) => (Date.parse(b.updatedAt || b.uploadedAt || '') || 0) - (Date.parse(a.updatedAt || a.uploadedAt || '') || 0))[0] || null;
+}
+
+function bootstrapCurrentSectionSeating(term, archiveCandidates = null) {
+  const currentPath = getSchedulePath(term);
+  const metadataPath = getScheduleMetadataPath(term);
+  if (!currentPath || !metadataPath) return { migrated: false, reason: 'invalid-term' };
+  if (fs.existsSync(currentPath)) {
+    const currentCsv = fs.readFileSync(currentPath, 'utf8');
+    if (isValidAllColumnsSectionSeatingCsv(currentCsv)) return { migrated: false, reason: 'current-all-columns' };
+  }
+
+  let candidates = archiveCandidates;
+  if (!Array.isArray(candidates)) {
+    const archivePath = getAnalyticsArchivePath(term);
+    if (!archivePath || !fs.existsSync(archivePath)) return { migrated: false, reason: 'archive-missing' };
+    const stats = fs.statSync(archivePath);
+    const entry = readAnalyticsArchiveManifest().terms.find(item => item.termCode === String(term || '').trim());
+    candidates = [{
+      csv: fs.readFileSync(archivePath, 'utf8'),
+      updatedAt: entry?.updatedAt || stats.mtime.toISOString(),
+      uploadedAt: entry?.updatedAt || stats.mtime.toISOString(),
+      sourceName: entry?.sourceName || path.basename(archivePath),
+      archivePath
+    }];
+  }
+  const selected = selectNewestValidAllColumnsArchive(candidates);
+  if (!selected) return { migrated: false, reason: 'valid-all-columns-archive-missing' };
+
+  const archiveTimestamp = selected.uploadedAt || selected.updatedAt || new Date().toISOString();
+  atomicWriteText(currentPath, selected.csv);
+  const source = {
+    kind: 'section-seating',
+    term,
+    name: safeFilename(selected.sourceName, `${term} All Columns archive`),
+    reportType: 'All Columns Section Seating',
+    uploadedAt: archiveTimestamp,
+    updatedAt: selected.updatedAt || archiveTimestamp,
+    migration: {
+      type: 'analytics-archive-bootstrap',
+      migratedAt: new Date().toISOString(),
+      archiveTimestamp
+    }
+  };
+  atomicWriteJson(metadataPath, source);
+  return { migrated: true, source };
+}
+
 function analyticsArchiveRowCountFromCsv(csv) {
   if (typeof csv !== 'string' || !csv.trim()) return 0;
   const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true, preview: 0 });
@@ -1426,6 +1506,12 @@ function getCurrentSectionSeating(req, res) {
   if (!filePath) {
     return res.status(400).json({ error: 'Invalid term' });
   }
+  try {
+    bootstrapCurrentSectionSeating(term);
+  } catch (err) {
+    console.error(`Current Section Seating bootstrap failed for ${term}:`, err.message || err);
+    return res.status(500).json({ error: 'Current Section Seating bootstrap failed' });
+  }
   if (!fs.existsSync(filePath)) {
     return res.json({ lastUpdated: null, source: null, data: [] });
   }
@@ -2458,5 +2544,8 @@ module.exports = {
   sortArchiveTermsNewestFirst,
   readAnalyticsArchiveManifest,
   rebuildAnalyticsArchiveManifest,
-  updateAnalyticsArchiveManifestEntry
+  updateAnalyticsArchiveManifestEntry,
+  isValidAllColumnsSectionSeatingCsv,
+  selectNewestValidAllColumnsArchive,
+  bootstrapCurrentSectionSeating
 };

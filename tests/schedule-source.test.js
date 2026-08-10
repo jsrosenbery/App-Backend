@@ -8,7 +8,10 @@ const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-schedule-source-'));
 process.env.DATA_DIR = path.join(dataRoot, 'cos-app');
 process.env.UPLOAD_PASSWORD = 'Upload2025';
 process.env.DEV_PASSWORD = 'DevSecret';
-const { app } = require('../server');
+const { app, selectNewestValidAllColumnsArchive } = require('../server');
+
+const legacyCsv = 'CRN,BUILDING,ROOM,DAYS,Time\n10001,VIS,101,MW,09:00-09:50\n';
+const allColumnsCsv = 'TERM,CRN,SUBJECT,COURSE,BUILDING,ROOM,DAYS,STARTTIME,ENDTIME,CAMPUS,INSTRUCTIONAL_METHOD_CODE,SCHD_CODE_SSRMEET,ACTUAL_ENROLL,MAX_ENROLL\nFALL 2026,20002,CHEM,001,VIS,205,MW,0900,0950,COS,IP,LEC,24,30\n';
 
 test.after(() => fs.rmSync(dataRoot, { recursive: true, force: true }));
 
@@ -70,4 +73,84 @@ test('analytics archive data cannot override the current schedule source', async
   } finally {
     server.close();
   }
+});
+
+test('legacy simple current is migrated from a newer valid All Columns archive without changing the archive', async () => {
+  const server = await listen();
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await request(baseUrl, '/api/section-seating/FALL%202028/current', {
+      method: 'POST', body: JSON.stringify({ password: 'Upload2025', sourceName: 'legacy-simple.csv', csv: legacyCsv })
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const archived = await request(baseUrl, '/api/analytics-archive/FALL%202028', {
+      method: 'POST', body: JSON.stringify({ password: 'Upload2025', csv: allColumnsCsv })
+    });
+    const archivePath = path.join(process.env.DATA_DIR, 'analytics-archive', 'FALL 2028.csv');
+    const archiveBefore = fs.readFileSync(archivePath, 'utf8');
+    const archiveMtime = fs.statSync(archivePath).mtimeMs;
+    const loaded = await request(baseUrl, '/api/section-seating/FALL%202028/current');
+
+    assert.equal(loaded.payload.data[0].CRN, '20002');
+    assert.equal(loaded.payload.source.reportType, 'All Columns Section Seating');
+    assert.equal(loaded.payload.source.uploadedAt, archived.payload.lastUpdated);
+    assert.equal(fs.readFileSync(archivePath, 'utf8'), archiveBefore);
+    assert.equal(fs.statSync(archivePath).mtimeMs, archiveMtime);
+  } finally {
+    server.close();
+  }
+});
+
+test('missing current is initialized from All Columns archive and migration is idempotent', async () => {
+  const server = await listen();
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await request(baseUrl, '/api/analytics-archive/SPRING%202029', {
+      method: 'POST', body: JSON.stringify({ password: 'Upload2025', csv: allColumnsCsv.replace('FALL 2026', 'SPRING 2029') })
+    });
+    const first = await request(baseUrl, '/api/section-seating/SPRING%202029/current');
+    const currentPath = path.join(process.env.DATA_DIR, 'SPRING 2029.csv');
+    const metadataPath = path.join(process.env.DATA_DIR, 'SPRING 2029.schedule-source.json');
+    const currentBefore = fs.readFileSync(currentPath, 'utf8');
+    const metadataBefore = fs.readFileSync(metadataPath, 'utf8');
+    const second = await request(baseUrl, '/api/section-seating/SPRING%202029/current');
+
+    assert.equal(first.payload.data[0].CRN, '20002');
+    assert.deepEqual(second.payload.data, first.payload.data);
+    assert.equal(fs.readFileSync(currentPath, 'utf8'), currentBefore);
+    assert.equal(fs.readFileSync(metadataPath, 'utf8'), metadataBefore);
+  } finally {
+    server.close();
+  }
+});
+
+test('valid newer All Columns current is untouched when an older archive exists', async () => {
+  const server = await listen();
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await request(baseUrl, '/api/analytics-archive/SUMMER%202029', {
+      method: 'POST', body: JSON.stringify({ password: 'Upload2025', csv: allColumnsCsv.replace('20002', '30003') })
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const currentCsv = allColumnsCsv.replace('20002', '40004');
+    const current = await request(baseUrl, '/api/section-seating/SUMMER%202029/current', {
+      method: 'POST', body: JSON.stringify({ password: 'Upload2025', sourceName: 'new-current.csv', csv: currentCsv })
+    });
+    const loaded = await request(baseUrl, '/api/section-seating/SUMMER%202029/current');
+    assert.equal(loaded.payload.data[0].CRN, '40004');
+    assert.equal(loaded.payload.source.name, 'new-current.csv');
+    assert.equal(loaded.payload.source.updatedAt, current.payload.source.updatedAt);
+    assert.equal(loaded.payload.source.migration, undefined);
+  } finally {
+    server.close();
+  }
+});
+
+test('newest valid All Columns archive candidate is selected by authoritative timestamp', () => {
+  const selected = selectNewestValidAllColumnsArchive([
+    { csv: allColumnsCsv.replace('20002', '50005'), updatedAt: '2029-01-01T00:00:00Z' },
+    { csv: legacyCsv, updatedAt: '2030-01-01T00:00:00Z' },
+    { csv: allColumnsCsv.replace('20002', '60006'), uploadedAt: '2029-02-01T00:00:00Z' }
+  ]);
+  assert.match(selected.csv, /60006/);
 });
