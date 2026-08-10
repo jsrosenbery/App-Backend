@@ -239,17 +239,24 @@ function normalizedCsvHeaders(csv) {
 function isValidAllColumnsSectionSeatingCsv(csv) {
   const headers = normalizedCsvHeaders(csv);
   const has = (...aliases) => aliases.some(alias => headers.has(alias));
-  const core = has('CRN', 'COURSEREFERENCENUMBER') && has('BUILDING') && has('ROOM');
-  const allColumnsSignals = [
-    has('INSTRUCTIONALMETHODCODE', 'INSMCODESSBSECT', 'INSTRUCTIONMETHODDESC'),
-    has('SCHDCODESSRMEET', 'SCHEDULETYPE'),
-    has('ACTUALENROLL', 'CURRENTENROLLMENT'),
-    has('MAXENROLL', 'MAXIMUMENROLLMENT', 'CAPACITY'),
-    has('CAMPUS', 'CAMPUSCODE'),
-    has('FACULTYNAME', 'INSTRUCTOR'),
-    has('XLIST', 'CROSSLIST')
-  ].filter(Boolean).length;
-  return core && allColumnsSignals >= 3;
+  const hasCoreRoomFields = has('CRN', 'COURSEREFERENCENUMBER') && has('BUILDING') && has('ROOM');
+  const hasInstructionalMethod = has(
+    'INSTRUCTIONALMETHODCODE',
+    'INSMCODESSBSECT',
+    'INSTRUCTIONALMETHOD',
+    'INSTRUCTIONMETHODDESC'
+  );
+  const hasScheduleType = has('SCHDCODESSRMEET', 'SCHDCODE', 'SCHEDULECODE', 'SCHEDULETYPE');
+  const hasEnrollmentOrCapacity = has(
+    'ACTUALENROLL',
+    'CURRENTENROLLMENT',
+    'CENSUSENROLL',
+    'ENROLLMENT',
+    'MAXENROLL',
+    'MAXIMUMENROLLMENT',
+    'CAPACITY'
+  );
+  return hasCoreRoomFields && hasInstructionalMethod && hasScheduleType && hasEnrollmentOrCapacity;
 }
 
 function selectNewestValidAllColumnsArchive(candidates = []) {

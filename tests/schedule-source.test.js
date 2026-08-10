@@ -8,9 +8,10 @@ const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cos-schedule-source-'));
 process.env.DATA_DIR = path.join(dataRoot, 'cos-app');
 process.env.UPLOAD_PASSWORD = 'Upload2025';
 process.env.DEV_PASSWORD = 'DevSecret';
-const { app, selectNewestValidAllColumnsArchive } = require('../server');
+const { app, isValidAllColumnsSectionSeatingCsv, selectNewestValidAllColumnsArchive } = require('../server');
 
 const legacyCsv = 'CRN,BUILDING,ROOM,DAYS,Time\n10001,VIS,101,MW,09:00-09:50\n';
+const historicalRoomAvailabilityCsv = 'CRN,BUILDING,ROOM,DAYS,STARTTIME,ENDTIME,CAMPUS,INSTRUCTOR,CAPACITY\n10001,VIS,101,MW,0900,0950,COS,Smith,30\n';
 const allColumnsCsv = 'TERM,CRN,SUBJECT,COURSE,BUILDING,ROOM,DAYS,STARTTIME,ENDTIME,CAMPUS,INSTRUCTIONAL_METHOD_CODE,SCHD_CODE_SSRMEET,ACTUAL_ENROLL,MAX_ENROLL\nFALL 2026,20002,CHEM,001,VIS,205,MW,0900,0950,COS,IP,LEC,24,30\n';
 
 test.after(() => fs.rmSync(dataRoot, { recursive: true, force: true }));
@@ -153,4 +154,9 @@ test('newest valid All Columns archive candidate is selected by authoritative ti
     { csv: allColumnsCsv.replace('20002', '60006'), uploadedAt: '2029-02-01T00:00:00Z' }
   ]);
   assert.match(selected.csv, /60006/);
+});
+
+test('All Columns detection rejects historical Room Availability exports with common room fields', () => {
+  assert.equal(isValidAllColumnsSectionSeatingCsv(historicalRoomAvailabilityCsv), false);
+  assert.equal(isValidAllColumnsSectionSeatingCsv(allColumnsCsv), true);
 });
