@@ -143,6 +143,34 @@ function getSchedulePath(term) {
   return filePath.startsWith(dataRoot) ? filePath : null;
 }
 
+function getScheduleMetadataPath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(DATA_DIR, `${term}.schedule-source.json`);
+  const dataRoot = path.resolve(DATA_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function readScheduleSource(term, stats = null) {
+  const metadataPath = getScheduleMetadataPath(term);
+  if (metadataPath && fs.existsSync(metadataPath)) {
+    try {
+      const source = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+      return {
+        kind: 'section-seating',
+        term,
+        name: source.name || `${term} All Columns`,
+        reportType: source.reportType || 'All Columns Section Seating',
+        uploadedAt: source.uploadedAt || source.updatedAt || stats?.mtime?.toISOString?.() || '',
+        updatedAt: source.updatedAt || source.uploadedAt || stats?.mtime?.toISOString?.() || ''
+      };
+    } catch (err) {
+      console.warn(`Schedule source metadata invalid for ${term}; using file timestamp:`, err.message || err);
+    }
+  }
+  const timestamp = stats?.mtime?.toISOString?.() || '';
+  return { kind: 'section-seating', term, name: `${term} All Columns`, reportType: 'Section Seating', uploadedAt: timestamp, updatedAt: timestamp };
+}
+
 function getAnalyticsArchivePath(term) {
   if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
   const filePath = path.resolve(ANALYTICS_ARCHIVE_DIR, `${term}.csv`);
@@ -1354,11 +1382,12 @@ app.post('/api/auth/role', (req, res) => {
   return res.json(issueEnrollmentSession(role));
 });
 
-// POST endpoint to upload schedule CSV
-app.post('/api/schedule/:term', (req, res) => {
+// One current Section Seating CSV per term. The legacy schedule routes and the
+// shared-current routes intentionally use this same file and metadata record.
+function saveCurrentSectionSeating(req, res) {
   const term = req.params.term;
-  const { csv, password } = req.body;
-  if (!isAuthorized(password)) {
+  const { csv, password, sourceName, reportType } = req.body;
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   if (typeof csv !== 'string') {
@@ -1372,22 +1401,33 @@ app.post('/api/schedule/:term', (req, res) => {
   try {
     fs.writeFileSync(filePath, csv);
     const now = new Date().toISOString();
-    return res.json({ success: true, lastUpdated: now });
+    const source = {
+      kind: 'section-seating',
+      term,
+      name: safeFilename(sourceName, `${term} All Columns`),
+      reportType: String(reportType || 'All Columns Section Seating').trim(),
+      uploadedAt: now,
+      updatedAt: now
+    };
+    atomicWriteJson(getScheduleMetadataPath(term), source);
+    return res.json({ success: true, lastUpdated: now, source });
   } catch (err) {
     console.error('Write error:', err);
     return res.status(500).json({ error: 'File write failed' });
   }
-});
+}
 
-// GET endpoint to fetch and parse schedule CSV
-app.get('/api/schedule/:term', (req, res) => {
+app.post('/api/section-seating/:term/current', saveCurrentSectionSeating);
+app.post('/api/schedule/:term', saveCurrentSectionSeating);
+
+function getCurrentSectionSeating(req, res) {
   const term = req.params.term;
   const filePath = getSchedulePath(term);
   if (!filePath) {
     return res.status(400).json({ error: 'Invalid term' });
   }
   if (!fs.existsSync(filePath)) {
-    return res.json({ lastUpdated: null, data: [] });
+    return res.json({ lastUpdated: null, source: null, data: [] });
   }
 
   try {
@@ -1395,12 +1435,16 @@ app.get('/api/schedule/:term', (req, res) => {
     const stats = fs.statSync(filePath);
     const lastUpdated = stats.mtime.toISOString();
     const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
-    return res.json({ lastUpdated, data: parsed.data });
+    const source = readScheduleSource(term, stats);
+    return res.json({ lastUpdated: source.updatedAt || lastUpdated, source, data: parsed.data });
   } catch (err) {
     console.error('Read error:', err);
     return res.status(500).json({ error: 'File read failed' });
   }
-});
+}
+
+app.get('/api/section-seating/:term/current', getCurrentSectionSeating);
+app.get('/api/schedule/:term', getCurrentSectionSeating);
 
 app.get('/api/analytics-archive', (req, res) => {
   try {
