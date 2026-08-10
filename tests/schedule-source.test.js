@@ -27,16 +27,16 @@ test('current schedule returns the newest upload and authoritative source metada
   const server = await listen();
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   try {
-    const older = await request(baseUrl, '/api/schedule/FALL%202026', {
+    const older = await request(baseUrl, '/api/section-seating/FALL%202026/current', {
       method: 'POST',
       body: JSON.stringify({ password: 'Upload2025', sourceName: 'misleading-2099.csv', csv: 'CRN,BUILDING,ROOM\n10001,VIS,101\n' })
     });
     await new Promise(resolve => setTimeout(resolve, 10));
-    const newer = await request(baseUrl, '/api/schedule/FALL%202026', {
+    const newer = await request(baseUrl, '/api/section-seating/FALL%202026/current', {
       method: 'POST',
       body: JSON.stringify({ password: 'Upload2025', sourceName: 'Fall 2026 All Columns.csv', csv: 'CRN,BUILDING,ROOM\n20002,VIS,205\n' })
     });
-    const loaded = await request(baseUrl, '/api/schedule/FALL%202026');
+    const loaded = await request(baseUrl, '/api/section-seating/FALL%202026/current');
 
     assert.equal(older.response.status, 200);
     assert.equal(newer.response.status, 200);
@@ -44,6 +44,9 @@ test('current schedule returns the newest upload and authoritative source metada
     assert.equal(loaded.payload.data[0].CRN, '20002');
     assert.equal(loaded.payload.source.name, 'Fall 2026 All Columns.csv');
     assert.equal(loaded.payload.source.updatedAt, newer.payload.source.updatedAt);
+    const legacyRoute = await request(baseUrl, '/api/schedule/FALL%202026');
+    assert.deepEqual(legacyRoute.payload.data, loaded.payload.data);
+    assert.deepEqual(legacyRoute.payload.source, loaded.payload.source);
   } finally {
     server.close();
   }
@@ -53,7 +56,7 @@ test('analytics archive data cannot override the current schedule source', async
   const server = await listen();
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   try {
-    await request(baseUrl, '/api/schedule/SPRING%202027', {
+    await request(baseUrl, '/api/section-seating/SPRING%202027/current', {
       method: 'POST',
       body: JSON.stringify({ password: 'Upload2025', sourceName: 'Spring 2027 All Columns.csv', csv: 'CRN,BUILDING,ROOM\n30003,VIS,301\n' })
     });
@@ -61,7 +64,7 @@ test('analytics archive data cannot override the current schedule source', async
       method: 'POST',
       body: JSON.stringify({ password: 'Upload2025', csv: 'CRN,BUILDING,ROOM\n99999,VIS,999\n' })
     });
-    const loaded = await request(baseUrl, '/api/schedule/SPRING%202027');
+    const loaded = await request(baseUrl, '/api/section-seating/SPRING%202027/current');
     assert.equal(loaded.payload.data[0].CRN, '30003');
     assert.equal(loaded.payload.source.kind, 'section-seating');
   } finally {

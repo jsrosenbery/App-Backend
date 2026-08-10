@@ -1382,11 +1382,12 @@ app.post('/api/auth/role', (req, res) => {
   return res.json(issueEnrollmentSession(role));
 });
 
-// POST endpoint to upload schedule CSV
-app.post('/api/schedule/:term', (req, res) => {
+// One current Section Seating CSV per term. The legacy schedule routes and the
+// shared-current routes intentionally use this same file and metadata record.
+function saveCurrentSectionSeating(req, res) {
   const term = req.params.term;
   const { csv, password, sourceName, reportType } = req.body;
-  if (!isAuthorized(password)) {
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   if (typeof csv !== 'string') {
@@ -1414,10 +1415,12 @@ app.post('/api/schedule/:term', (req, res) => {
     console.error('Write error:', err);
     return res.status(500).json({ error: 'File write failed' });
   }
-});
+}
 
-// GET endpoint to fetch and parse schedule CSV
-app.get('/api/schedule/:term', (req, res) => {
+app.post('/api/section-seating/:term/current', saveCurrentSectionSeating);
+app.post('/api/schedule/:term', saveCurrentSectionSeating);
+
+function getCurrentSectionSeating(req, res) {
   const term = req.params.term;
   const filePath = getSchedulePath(term);
   if (!filePath) {
@@ -1438,7 +1441,10 @@ app.get('/api/schedule/:term', (req, res) => {
     console.error('Read error:', err);
     return res.status(500).json({ error: 'File read failed' });
   }
-});
+}
+
+app.get('/api/section-seating/:term/current', getCurrentSectionSeating);
+app.get('/api/schedule/:term', getCurrentSectionSeating);
 
 app.get('/api/analytics-archive', (req, res) => {
   try {
