@@ -423,3 +423,96 @@ test('Low Enrollment Tracking concurrent writes leave valid JSON and preserve bo
     await new Promise(resolve => server.close(resolve));
   }
 });
+
+test('Low Enrollment Tracking imports manual fields atomically without changing enrollment data', async () => {
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const headers = await authHeaders(baseUrl);
+    const workspace = workspaceFixture('202750');
+    workspace.rows[0].justification = 'Other';
+    workspace.rows[0].vpComments = 'Clear both';
+    await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202750', {
+      method: 'POST', headers, body: JSON.stringify({ workspace })
+    });
+
+    const imported = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202750/manual-import', {
+      method: 'POST', headers, body: JSON.stringify({
+        sourceFilename: 'Fall-2026-Tracking.xlsx',
+        updates: [
+          { rowId: 'row-10003', justification: '', vpComments: '', expectedJustification: 'Other', expectedVpComments: 'Clear both' },
+          { rowId: 'row-cross', justification: 'Dual Enrollment', vpComments: 'Reviewed in Excel.', expectedJustification: '', expectedVpComments: '' }
+        ]
+      })
+    });
+    assert.equal(imported.response.status, 200);
+    assert.equal(imported.payload.data.rows[0].justification, '');
+    assert.equal(imported.payload.data.rows[0].vpComments, '');
+    assert.equal(imported.payload.data.rows[0].latestEnrollment, 12);
+    assert.equal(imported.payload.data.snapshots.length, 1);
+    assert.equal(imported.payload.summary.clearedJustifications, 1);
+    assert.equal(imported.payload.summary.clearedVpComments, 1);
+
+    const rejected = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202750/manual-import', {
+      method: 'POST', headers, body: JSON.stringify({ updates: [
+        { rowId: 'row-10003', justification: 'Other', vpComments: 'Would change', expectedJustification: '', expectedVpComments: '' },
+        { rowId: 'row-cross', justification: 'Typed custom reason', vpComments: '', expectedJustification: 'Dual Enrollment', expectedVpComments: 'Reviewed in Excel.' }
+      ] })
+    });
+    assert.equal(rejected.response.status, 400);
+    assert.equal(rejected.payload.code, 'INVALID_JUSTIFICATION');
+    const loaded = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202750');
+    assert.equal(loaded.payload.data.rows[0].justification, '');
+    assert.equal(loaded.payload.data.rows[0].vpComments, '');
+
+    const conflict = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202750/manual-import', {
+      method: 'POST', headers, body: JSON.stringify({ updates: [
+        { rowId: 'row-10003', justification: 'Other', vpComments: 'Old export', expectedJustification: 'Other', expectedVpComments: 'Stale value' }
+      ] })
+    });
+    assert.equal(conflict.response.status, 409);
+    assert.equal(conflict.payload.code, 'MANUAL_IMPORT_CONFLICT');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('Low Enrollment Tracking exclusions are reversible and survive enrollment snapshots', async () => {
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const headers = await authHeaders(baseUrl);
+    const workspace = workspaceFixture('202760');
+    await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202760', {
+      method: 'POST', headers, body: JSON.stringify({ workspace })
+    });
+    const excluded = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202760/rows/row-10003/exclusion', {
+      method: 'POST', headers, body: JSON.stringify({ excluded: true, reason: 'Open lab', note: 'LA 425' })
+    });
+    assert.equal(excluded.response.status, 200);
+    assert.equal(excluded.payload.data.row.exclusion.excluded, true);
+
+    const snapshotRows = workspace.rows.map(row => row.id === 'row-10003'
+      ? { ...row, latestEnrollment: 15, highestEnrollment: 15 }
+      : row);
+    const snapshot = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202760/snapshots', {
+      method: 'POST', headers, body: JSON.stringify({
+        snapshot: { snapshotDate: '2026-09-01', type: 'enrollment-update', values: { 'row-10003': { enrollment: 15 } } },
+        rows: snapshotRows
+      })
+    });
+    assert.equal(snapshot.response.status, 200);
+    assert.equal(snapshot.payload.data.rows[0].exclusion.excluded, true);
+    assert.equal(snapshot.payload.data.rows[0].latestEnrollment, 15);
+
+    const restored = await jsonRequest(baseUrl, '/api/low-enrollment-tracking/202760/rows/row-10003/exclusion', {
+      method: 'POST', headers, body: JSON.stringify({ excluded: false, reason: '', note: '' })
+    });
+    assert.equal(restored.response.status, 200);
+    assert.equal(restored.payload.data.row.exclusion.excluded, false);
+    const saved = JSON.parse(fs.readFileSync(trackerPath('202760'), 'utf8'));
+    assert.equal(saved.exclusionHistory.length, 2);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});

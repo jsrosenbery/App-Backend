@@ -2151,6 +2151,7 @@ function mergeLowEnrollmentSnapshotRows(savedRows = [], incomingRows = []) {
       crns: savedRow.crns,
       justification: savedRow.justification || '',
       vpComments: savedRow.vpComments || '',
+      exclusion: savedRow.exclusion || null,
       createdAt: savedRow.createdAt,
       updatedAt: savedRow.updatedAt
     };
@@ -2162,6 +2163,48 @@ function mergeLowEnrollmentSnapshotRows(savedRows = [], incomingRows = []) {
     if (merged.latestEnrollment !== null) merged.currentEnrollment = merged.latestEnrollment;
     merged.status = lowEnrollmentStatusForRow(merged);
     return merged;
+  });
+}
+
+function validateLowEnrollmentManualUpdates(workspace, updates) {
+  if (!Array.isArray(updates) || !updates.length) {
+    throw lowEnrollmentError('At least one manual field update is required.', 'INVALID_MANUAL_IMPORT', 400);
+  }
+  const rowsById = new Map((workspace.rows || []).map(row => [String(row.id), row]));
+  const seen = new Set();
+  const allowedReasons = lowEnrollmentAllowedReasons(workspace);
+  return updates.map((update, index) => {
+    if (!update || typeof update !== 'object' || Array.isArray(update)) {
+      throw lowEnrollmentError(`Manual update ${index + 1} is invalid.`, 'INVALID_MANUAL_IMPORT', 400);
+    }
+    const attemptedFields = Object.keys(update);
+    const allowedFields = new Set(['rowId', 'justification', 'vpComments', 'expectedJustification', 'expectedVpComments']);
+    const disallowedFields = attemptedFields.filter(field => !allowedFields.has(field));
+    if (disallowedFields.length) {
+      throw lowEnrollmentError(`Unsupported manual import field(s): ${disallowedFields.join(', ')}.`, 'INVALID_MANUAL_IMPORT', 400);
+    }
+    const rowId = String(update.rowId || '').trim();
+    if (!rowId || !rowsById.has(rowId)) throw lowEnrollmentError(`Tracker row not found: ${rowId || index + 1}.`, 'ROW_NOT_FOUND', 404);
+    if (seen.has(rowId)) throw lowEnrollmentError(`Duplicate manual update row: ${rowId}.`, 'INVALID_MANUAL_IMPORT', 400);
+    seen.add(rowId);
+    if (!Object.prototype.hasOwnProperty.call(update, 'justification') || !Object.prototype.hasOwnProperty.call(update, 'vpComments')) {
+      throw lowEnrollmentError('Each manual update must include Justification and VP comments.', 'INVALID_MANUAL_IMPORT', 400);
+    }
+    const justification = String(update.justification || '').trim();
+    if (justification.length > 500 || (justification && !allowedReasons.includes(justification))) {
+      throw lowEnrollmentError(`Invalid justification for tracker row ${rowId}.`, 'INVALID_JUSTIFICATION', 400);
+    }
+    if (typeof update.vpComments !== 'string' || update.vpComments.length > 10000) {
+      throw lowEnrollmentError(`Invalid VP comments for tracker row ${rowId}.`, 'INVALID_MANUAL_IMPORT', 400);
+    }
+    if (typeof update.expectedJustification !== 'string' || typeof update.expectedVpComments !== 'string') {
+      throw lowEnrollmentError('Manual updates must include the original exported manual values.', 'INVALID_MANUAL_IMPORT', 400);
+    }
+    const savedRow = rowsById.get(rowId);
+    if (String(savedRow.justification || '').trim() !== update.expectedJustification.trim() || String(savedRow.vpComments || '') !== update.expectedVpComments) {
+      throw lowEnrollmentError(`Tracker row ${rowId} changed after this workbook was exported. Refresh the dashboard and export a new workbook.`, 'MANUAL_IMPORT_CONFLICT', 409);
+    }
+    return { row: savedRow, rowId, justification, vpComments: update.vpComments };
   });
 }
 
@@ -2298,6 +2341,80 @@ app.patch('/api/low-enrollment-tracking/:termCode/rows/:rowId', async (req, res)
   } catch (err) {
     console.error('Low Enrollment Tracking row update error:', err?.code || err?.message || err);
     return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking row update failed');
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:termCode/manual-import', async (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  const actorRole = requireEnrollmentRole(req, res, 'development');
+  if (!actorRole) return;
+  try {
+    const result = await withLowEnrollmentTermLock(termCode, async () => {
+      const workspace = readLowEnrollmentWorkspace(termCode);
+      if (!workspace) throw lowEnrollmentError('Low Enrollment Tracking workspace not found.', 'WORKSPACE_NOT_FOUND', 404);
+      const validated = validateLowEnrollmentManualUpdates(workspace, req.body?.updates);
+      const now = new Date().toISOString();
+      let clearedJustifications = 0;
+      let clearedVpComments = 0;
+      validated.forEach(({ row, justification, vpComments }) => {
+        if (row.justification && !justification) clearedJustifications += 1;
+        if (row.vpComments && !vpComments) clearedVpComments += 1;
+        row.justification = justification;
+        row.vpComments = vpComments;
+        row.updatedAt = now;
+      });
+      const history = {
+        type: 'manual-field-import',
+        sourceFilename: String(req.body?.sourceFilename || '').trim(),
+        uploadedAt: now,
+        rowsUpdated: validated.length,
+        clearedJustifications,
+        clearedVpComments,
+        uploadedByRole: actorRole
+      };
+      workspace.uploadHistory = [...(workspace.uploadHistory || []), history];
+      workspace.updatedAt = now;
+      writeLowEnrollmentWorkspaceAtomic(workspace);
+      return { workspace, history };
+    });
+    return res.json({ success: true, data: result.workspace, summary: result.history });
+  } catch (err) {
+    console.error('Low Enrollment Tracking manual import error:', err?.code || err?.message || err);
+    return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking manual import failed');
+  }
+});
+
+app.post('/api/low-enrollment-tracking/:termCode/rows/:rowId/exclusion', async (req, res) => {
+  const termCode = String(req.params.termCode || '').trim();
+  const rowId = String(req.params.rowId || '').trim();
+  if (!isValidLowEnrollmentTermCode(termCode)) return sendLowEnrollmentError(res, lowEnrollmentError('Invalid term code.', 'INVALID_TERM', 400));
+  const actorRole = requireEnrollmentRole(req, res, 'development');
+  if (!actorRole) return;
+  try {
+    const result = await withLowEnrollmentTermLock(termCode, async () => {
+      const workspace = readLowEnrollmentWorkspace(termCode);
+      if (!workspace) throw lowEnrollmentError('Low Enrollment Tracking workspace not found.', 'WORKSPACE_NOT_FOUND', 404);
+      const row = (workspace.rows || []).find(item => String(item.id) === rowId);
+      if (!row) throw lowEnrollmentError('Tracker row not found.', 'ROW_NOT_FOUND', 404);
+      if (typeof req.body?.excluded !== 'boolean') throw lowEnrollmentError('Excluded must be true or false.', 'INVALID_EXCLUSION', 400);
+      const reason = String(req.body?.reason || '').trim();
+      const note = String(req.body?.note || '');
+      if (req.body.excluded && !reason) throw lowEnrollmentError('An exclusion reason is required.', 'INVALID_EXCLUSION', 400);
+      if (reason.length > 500 || note.length > 10000) throw lowEnrollmentError('Exclusion reason or note is too long.', 'INVALID_EXCLUSION', 400);
+      const now = new Date().toISOString();
+      row.exclusion = { excluded: req.body.excluded, reason, note, changedAt: now, changedByRole: actorRole };
+      row.updatedAt = now;
+      const history = { rowId, excluded: req.body.excluded, reason, note, changedAt: now, changedByRole: actorRole };
+      workspace.exclusionHistory = [...(workspace.exclusionHistory || []), history];
+      workspace.updatedAt = now;
+      writeLowEnrollmentWorkspaceAtomic(workspace);
+      return { workspace, row, history };
+    });
+    return res.json({ success: true, row: result.row, data: { row: result.row, workspaceUpdatedAt: result.workspace.updatedAt } });
+  } catch (err) {
+    console.error('Low Enrollment Tracking exclusion error:', err?.code || err?.message || err);
+    return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking exclusion update failed');
   }
 });
 

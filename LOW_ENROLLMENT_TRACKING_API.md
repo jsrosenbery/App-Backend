@@ -71,6 +71,14 @@ Updates one or both editable fields:
 
 Unsupported fields are rejected. Justification must be blank or exactly match one of the saved workspace reasons.
 
+### `POST /api/low-enrollment-tracking/:termCode/manual-import`
+
+Atomically applies Justification and VP comment changes parsed from a Timber tracker export. Every update must contain a known stable row ID and both manual fields. Blank values intentionally clear saved values. Any unknown row or non-dropdown justification rejects the entire request; enrollment fields and snapshots are never accepted by this endpoint.
+
+### `POST /api/low-enrollment-tracking/:termCode/rows/:rowId/exclusion`
+
+Excludes or restores one row for the selected term. Exclusion requires a reason, retains all enrollment history, and is recorded in `exclusionHistory`. The row-level exclusion metadata is preserved by enrollment snapshot saves. A restored row becomes active again without recreating it.
+
 ## Error Shape
 
 Errors use:
