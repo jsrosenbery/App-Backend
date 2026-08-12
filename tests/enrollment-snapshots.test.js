@@ -170,6 +170,36 @@ test('role authentication honors hierarchical password access', async () => {
   }
 });
 
+test('authenticated activity refreshes the same role session for another idle window', async () => {
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const auth = await jsonRequest(baseUrl, '/api/auth/role', {
+      method: 'POST',
+      body: JSON.stringify({ password: 'DeanSecret', requestedRole: 'dean' })
+    });
+    assert.equal(auth.response.status, 200);
+
+    const refreshed = await jsonRequest(baseUrl, '/api/auth/refresh', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${auth.payload.token}` }
+    });
+    assert.equal(refreshed.response.status, 200);
+    assert.equal(refreshed.payload.token, auth.payload.token);
+    assert.equal(refreshed.payload.role, 'dean');
+    assert.ok(Date.parse(refreshed.payload.expiresAt) >= Date.parse(auth.payload.expiresAt));
+    assert.equal(refreshed.payload.expiresInSeconds, 30 * 60);
+
+    const rejected = await jsonRequest(baseUrl, '/api/auth/refresh', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer invalid-token' }
+    });
+    assert.equal(rejected.response.status, 401);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 
 
 
