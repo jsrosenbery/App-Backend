@@ -508,6 +508,23 @@ function issueEnrollmentSession(role = 'em') {
   };
 }
 
+function refreshEnrollmentSession(token) {
+  cleanupEnrollmentSessions();
+  const session = enrollmentSessions.get(token);
+  if (!session) return null;
+  const role = typeof session === 'number' ? 'em' : session.role || 'em';
+  const expiresAtMs = Date.now() + ENROLLMENT_SESSION_TTL_MS;
+  enrollmentSessions.set(token, { expiresAtMs, role });
+  return {
+    token,
+    role,
+    roleLabel: ROLE_LABEL[role] || role,
+    roleLevel: ROLE_LEVEL[role] || 0,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    expiresInSeconds: Math.floor(ENROLLMENT_SESSION_TTL_MS / 1000)
+  };
+}
+
 function cleanupEnrollmentSessions() {
   const now = Date.now();
   for (const [token, session] of enrollmentSessions.entries()) {
@@ -1467,6 +1484,13 @@ app.post('/api/auth/role', (req, res) => {
   }
   clearAuthenticationFailures(authKey);
   return res.json(issueEnrollmentSession(role));
+});
+
+app.post('/api/auth/refresh', (req, res) => {
+  const token = getBearerToken(req);
+  const refreshed = token ? refreshEnrollmentSession(token) : null;
+  if (!refreshed) return res.status(401).json({ error: 'Enrollment Management session is required.', code: 'UNAUTHORIZED' });
+  return res.json(refreshed);
 });
 
 // One current Section Seating CSV per term. The legacy schedule routes and the
