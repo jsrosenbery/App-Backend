@@ -107,6 +107,7 @@ const ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1;
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
 const LOW_ENROLLMENT_TRACKING_DIR = path.join(DATA_DIR, 'low-enrollment-tracking');
+const CATALOG_PROGRAM_REQUIREMENTS_PATH = path.join(DATA_DIR, 'catalog-program-requirements.json');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
 }
@@ -2123,6 +2124,51 @@ function writeLowEnrollmentWorkspaceAtomic(workspace) {
   }
 }
 
+function normalizeCatalogProgramRequirementsRepository(data = {}) {
+  const source = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  return {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    exportedAt: source.exportedAt || source.updatedAt || new Date().toISOString(),
+    catalogSources: Array.isArray(source.catalogSources) ? source.catalogSources : [],
+    catalogPages: Array.isArray(source.catalogPages) ? source.catalogPages : [],
+    catalogProgramCandidates: Array.isArray(source.catalogProgramCandidates) ? source.catalogProgramCandidates : [],
+    catalogRequirementDetails: Array.isArray(source.catalogRequirementDetails) ? source.catalogRequirementDetails : [],
+    catalogReviewDecisions: Array.isArray(source.catalogReviewDecisions) ? source.catalogReviewDecisions : [],
+    programs: Array.isArray(source.programs) ? source.programs : [],
+    programRequirementRevisions: Array.isArray(source.programRequirementRevisions) ? source.programRequirementRevisions : [],
+    programActiveRevisionPointers: Array.isArray(source.programActiveRevisionPointers) ? source.programActiveRevisionPointers : [],
+    programReviewHistory: Array.isArray(source.programReviewHistory) ? source.programReviewHistory : []
+  };
+}
+
+function readCatalogProgramRequirementsRepository() {
+  if (!fs.existsSync(CATALOG_PROGRAM_REQUIREMENTS_PATH)) return normalizeCatalogProgramRequirementsRepository();
+  return normalizeCatalogProgramRequirementsRepository(JSON.parse(fs.readFileSync(CATALOG_PROGRAM_REQUIREMENTS_PATH, 'utf8')));
+}
+
+function writeCatalogProgramRequirementsRepositoryAtomic(data) {
+  const normalized = normalizeCatalogProgramRequirementsRepository(data);
+  const tempPath = `${CATALOG_PROGRAM_REQUIREMENTS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  const json = JSON.stringify(normalized, null, 2);
+  let fd = null;
+  try {
+    fd = fs.openSync(tempPath, 'w');
+    fs.writeFileSync(fd, json, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tempPath, CATALOG_PROGRAM_REQUIREMENTS_PATH);
+    return normalized;
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch (_closeErr) {}
+    }
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (_unlinkErr) {}
+    throw err;
+  }
+}
+
 async function withLowEnrollmentTermLock(termCode, operation) {
   const prior = lowEnrollmentTermLocks.get(termCode) || Promise.resolve();
   let release = () => {};
@@ -2439,6 +2485,30 @@ app.post('/api/low-enrollment-tracking/:termCode/rows/:rowId/exclusion', async (
   } catch (err) {
     console.error('Low Enrollment Tracking exclusion error:', err?.code || err?.message || err);
     return sendLowEnrollmentError(res, err, 'Low Enrollment Tracking exclusion update failed');
+  }
+});
+
+app.get('/api/catalog-program-requirements', (req, res) => {
+  const actorRole = requireEnrollmentRole(req, res, 'admin');
+  if (!actorRole) return;
+  try {
+    const data = readCatalogProgramRequirementsRepository();
+    return res.json({ success: true, data, updatedAt: data.updatedAt || '' });
+  } catch (err) {
+    console.error('Catalog Program Requirements read error:', err);
+    return res.status(500).json({ error: 'Catalog Program Requirements read failed.', code: 'STORAGE_FAILURE' });
+  }
+});
+
+app.post('/api/catalog-program-requirements', (req, res) => {
+  const actorRole = requireEnrollmentRole(req, res, 'admin');
+  if (!actorRole) return;
+  try {
+    const data = writeCatalogProgramRequirementsRepositoryAtomic(req.body || {});
+    return res.json({ success: true, data, updatedAt: data.updatedAt || '' });
+  } catch (err) {
+    console.error('Catalog Program Requirements save error:', err);
+    return res.status(500).json({ error: 'Catalog Program Requirements save failed.', code: 'STORAGE_FAILURE' });
   }
 });
 

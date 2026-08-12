@@ -143,6 +143,46 @@ test('Low Enrollment Tracking requires Development/Admin access for writes', asy
   }
 });
 
+test('Catalog Program Requirements persists shared repository data with admin access', async () => {
+  const server = await listen();
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const unauthorized = await jsonRequest(baseUrl, '/api/catalog-program-requirements');
+    assert.equal(unauthorized.response.status, 401);
+    assert.equal(unauthorized.payload.code, 'UNAUTHORIZED');
+
+    const developmentHeaders = await authHeaders(baseUrl, 'DevSecret', 'development');
+    const forbidden = await jsonRequest(baseUrl, '/api/catalog-program-requirements', {
+      method: 'POST',
+      headers: developmentHeaders,
+      body: JSON.stringify({ schemaVersion: 1, programs: [] })
+    });
+    assert.equal(forbidden.response.status, 403);
+    assert.equal(forbidden.payload.code, 'FORBIDDEN');
+
+    const adminHeaders = await authHeaders(baseUrl, 'AdminSecret', 'admin');
+    const saved = await jsonRequest(baseUrl, '/api/catalog-program-requirements', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        schemaVersion: 1,
+        programs: [{ programId: 'AG-CERT', catalogYear: '2026-2027', programName: 'Agriculture Certificate' }],
+        catalogSources: [{ catalogSourceId: 'source-1', filename: 'ag.pdf' }]
+      })
+    });
+    assert.equal(saved.response.status, 200);
+    assert.equal(saved.payload.data.programs.length, 1);
+    assert.equal(saved.payload.data.catalogSources.length, 1);
+
+    const loaded = await jsonRequest(baseUrl, '/api/catalog-program-requirements', { headers: adminHeaders });
+    assert.equal(loaded.response.status, 200);
+    assert.equal(loaded.payload.data.programs[0].programId, 'AG-CERT');
+    assert.equal(loaded.payload.data.catalogSources[0].filename, 'ag.pdf');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('Low Enrollment Tracking persists workspaces, replacement rules, warnings, and reloads', async () => {
   const server = await listen();
   try {
