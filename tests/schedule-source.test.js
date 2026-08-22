@@ -56,6 +56,46 @@ test('current schedule returns the newest upload and authoritative source metada
   }
 });
 
+test('room events persist by term with source metadata and protected writes', async () => {
+  const server = await listen();
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const denied = await request(baseUrl, '/api/room-events/FALL%202026', {
+      method: 'POST',
+      body: JSON.stringify({ password: 'wrong', events: [] })
+    });
+    assert.equal(denied.response.status, 403);
+
+    const saved = await request(baseUrl, '/api/room-events/FALL%202026', {
+      method: 'POST',
+      body: JSON.stringify({
+        password: 'Upload2025',
+        sourceName: 'TIMBER_Events_20260821.csv',
+        importedAt: '2026-08-21T16:42:00.000Z',
+        events: [{ term: 'FALL 2026', building: 'COSEXT', room: 'GF COURT', roomKey: 'COSEXT-GF COURT', eventId: 'D1', name: 'Event', days: ['Friday'], start: '09:00', end: '10:00', startMinutes: 540, endMinutes: 600, valid: true }]
+      })
+    });
+    assert.equal(saved.response.status, 200);
+    assert.equal(saved.payload.count, 1);
+
+    const loaded = await request(baseUrl, '/api/room-events/FALL%202026');
+    assert.equal(loaded.response.status, 200);
+    assert.equal(loaded.payload.data[0].roomKey, 'COSEXT-GF COURT');
+    assert.equal(loaded.payload.data[0].importedAt, '2026-08-21T16:42:00.000Z');
+    assert.equal(loaded.payload.source.name, 'TIMBER_Events_20260821.csv');
+
+    const cleared = await request(baseUrl, '/api/room-events/FALL%202026', {
+      method: 'DELETE',
+      body: JSON.stringify({ password: 'Upload2025' })
+    });
+    assert.equal(cleared.response.status, 200);
+    const empty = await request(baseUrl, '/api/room-events/FALL%202026');
+    assert.deepEqual(empty.payload.data, []);
+  } finally {
+    server.close();
+  }
+});
+
 test('analytics archive data cannot override the current schedule source', async () => {
   const server = await listen();
   const baseUrl = `http://127.0.0.1:${server.address().port}`;

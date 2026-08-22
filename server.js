@@ -107,6 +107,7 @@ const ANALYTICS_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1;
 const FACULTY_SCHEDULES_DIR = path.join(DATA_DIR, 'faculty-schedules');
 const WORK_EXPERIENCE_DIR = path.join(DATA_DIR, 'work-experience');
 const LOW_ENROLLMENT_TRACKING_DIR = path.join(DATA_DIR, 'low-enrollment-tracking');
+const ROOM_EVENTS_DIR = path.join(DATA_DIR, 'room-events');
 const CATALOG_PROGRAM_REQUIREMENTS_PATH = path.join(DATA_DIR, 'catalog-program-requirements.json');
 if (!fs.existsSync(CONVERT_DIR)) {
   fs.mkdirSync(CONVERT_DIR, { recursive: true });
@@ -122,6 +123,9 @@ if (!fs.existsSync(WORK_EXPERIENCE_DIR)) {
 }
 if (!fs.existsSync(LOW_ENROLLMENT_TRACKING_DIR)) {
   fs.mkdirSync(LOW_ENROLLMENT_TRACKING_DIR, { recursive: true });
+}
+if (!fs.existsSync(ROOM_EVENTS_DIR)) {
+  fs.mkdirSync(ROOM_EVENTS_DIR, { recursive: true });
 }
 
 const DEFAULT_MODALITY_DEFINITIONS = [
@@ -149,6 +153,50 @@ function getScheduleMetadataPath(term) {
   const filePath = path.resolve(DATA_DIR, `${term}.schedule-source.json`);
   const dataRoot = path.resolve(DATA_DIR) + path.sep;
   return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function getRoomEventsPath(term) {
+  if (!/^[a-z0-9 _-]+$/i.test(term)) return null;
+  const filePath = path.resolve(ROOM_EVENTS_DIR, `${term}.json`);
+  const dataRoot = path.resolve(ROOM_EVENTS_DIR) + path.sep;
+  return filePath.startsWith(dataRoot) ? filePath : null;
+}
+
+function normalizeRoomEventForStorage(event, term, sourceName, importedAt) {
+  const row = event && typeof event === 'object' ? event : {};
+  return {
+    term: String(row.term || term || '').trim().toUpperCase(),
+    campus: String(row.campus || '').trim(),
+    building: String(row.building || '').trim().toUpperCase(),
+    room: String(row.room || '').trim().toUpperCase(),
+    roomKey: String(row.roomKey || '').trim().toUpperCase(),
+    eventId: String(row.eventId || '').trim(),
+    name: String(row.name || '').trim(),
+    days: Array.isArray(row.days) ? row.days.map(day => String(day || '').trim()).filter(Boolean) : [],
+    start: String(row.start || '').trim(),
+    end: String(row.end || '').trim(),
+    startMinutes: Number.isFinite(Number(row.startMinutes)) ? Number(row.startMinutes) : null,
+    endMinutes: Number.isFinite(Number(row.endMinutes)) ? Number(row.endMinutes) : null,
+    startDate: String(row.startDate || '').trim(),
+    endDate: String(row.endDate || '').trim(),
+    type: String(row.type || '').trim(),
+    notes: String(row.notes || '').trim(),
+    source: String(row.source || sourceName || '').trim(),
+    importedAt: String(row.importedAt || importedAt || '').trim(),
+    valid: row.valid === true
+  };
+}
+
+function readRoomEvents(term) {
+  const filePath = getRoomEventsPath(term);
+  if (!filePath) return null;
+  if (!fs.existsSync(filePath)) return { term: String(term || '').toUpperCase(), source: null, data: [] };
+  const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  return {
+    term: String(payload.term || term || '').toUpperCase(),
+    source: payload.source || null,
+    data: Array.isArray(payload.data) ? payload.data : []
+  };
 }
 
 function readScheduleSource(term, stats = null) {
@@ -2650,6 +2698,61 @@ app.post('/api/rooms/import', (req, res) => {
   } catch (err) {
     console.error('Room catalog write error:', err);
     return res.status(500).json({ error: 'Room catalog write failed' });
+  }
+});
+
+app.get('/api/room-events/:term', (req, res) => {
+  const term = req.params.term;
+  if (!getRoomEventsPath(term)) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    const payload = readRoomEvents(term);
+    return res.json({ success: true, term: payload.term, source: payload.source, lastUpdated: payload.source?.updatedAt || null, data: payload.data });
+  } catch (err) {
+    console.error('Room events read error:', err);
+    return res.status(500).json({ error: 'Room events read failed' });
+  }
+});
+
+app.post('/api/room-events/:term', (req, res) => {
+  const term = req.params.term;
+  const { password, events, mode = 'replace', sourceName, importedAt } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) return res.status(403).json({ error: 'Unauthorized' });
+  const filePath = getRoomEventsPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  if (!Array.isArray(events)) return res.status(400).json({ error: 'Room events payload is required' });
+  if (events.length > 20000) return res.status(400).json({ error: 'Room events payload is too large' });
+  try {
+    const now = new Date().toISOString();
+    const prior = mode === 'append' ? readRoomEvents(term).data : [];
+    const incoming = events.map(event => normalizeRoomEventForStorage(event, term, sourceName, importedAt || now));
+    const source = {
+      kind: 'room-events',
+      term: String(term || '').toUpperCase(),
+      name: safeFilename(sourceName, `${term} Room Events`),
+      uploadedAt: String(importedAt || now),
+      updatedAt: now
+    };
+    const payload = { term: source.term, source, data: [...prior, ...incoming] };
+    atomicWriteJson(filePath, payload);
+    return res.json({ success: true, term: payload.term, source, lastUpdated: now, count: payload.data.length, data: payload.data });
+  } catch (err) {
+    console.error('Room events write error:', err);
+    return res.status(500).json({ error: 'Room events write failed' });
+  }
+});
+
+app.delete('/api/room-events/:term', (req, res) => {
+  const term = req.params.term;
+  const { password } = req.body || {};
+  if (!isEnrollmentSessionAuthorized(req) && !isAuthorized(password)) return res.status(403).json({ error: 'Unauthorized' });
+  const filePath = getRoomEventsPath(term);
+  if (!filePath) return res.status(400).json({ error: 'Invalid term' });
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return res.json({ success: true, term: String(term || '').toUpperCase(), data: [] });
+  } catch (err) {
+    console.error('Room events delete error:', err);
+    return res.status(500).json({ error: 'Room events delete failed' });
   }
 });
 
